@@ -23,3 +23,7 @@ Steps below use the new `demo_strlen` syscall as an example and assume the tree 
 Debug info (for repeatable GDB setup)
 - This tree’s `.config` was not modified; no debug info was enabled by default.
 - To build with DWARF symbols in a fresh checkout: run `./scripts/config --enable CONFIG_DEBUG_INFO` (optionally also `CONFIG_DEBUG_INFO_DWARF4`/`CONFIG_DEBUG_INFO_DWARF5` and `CONFIG_GDB_SCRIPTS`), then rebuild with `make -j$(($(nproc)/2)) bzImage`.
+- If you want a reproducible debug-ready config without touching upstream defconfig, apply the provided fragment and regenerate `.config`:
+  - `./scripts/kconfig/merge_config.sh arch/x86/configs/defconfig tools/demo-syscall/debug.config`
+  - `make olddefconfig`
+  - `make -j$(($(nproc)/2)) bzImage`
