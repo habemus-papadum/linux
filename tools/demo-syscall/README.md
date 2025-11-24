@@ -27,3 +27,17 @@ Debug info (for repeatable GDB setup)
   - `./scripts/kconfig/merge_config.sh arch/x86/configs/defconfig tools/demo-syscall/debug.config`
   - `make olddefconfig` (keeps your current settings, fills in new/unset symbols with defaults; `make defconfig` instead blows away your config and re-seeds from the stock defconfig)
   - `make -j$(($(nproc)/2)) bzImage`
+
+Arm64 build/run notes
+- The syscall is registered for arm64 (entry #470 in `arch/arm64/tools/syscall_64.tbl` and the compat table).
+- You’ll need a cross toolchain (e.g., `gcc-aarch64-linux-gnu`) and `qemu-system-aarch64`.
+- To create a debug-ready arm64 config:\
+  `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ./scripts/kconfig/merge_config.sh arch/arm64/configs/defconfig tools/demo-syscall/debug.config`\
+  `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make olddefconfig`
+- Build kernel and initramfs for arm64:\
+  `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(($(nproc)/2)) Image`\
+  `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc make -C tools/demo-syscall`
+- Example QEMU run (arm64):\
+  `qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 1024 -smp 4 -nographic \`\
+  `  -kernel arch/arm64/boot/Image -initrd tools/demo-syscall/build/initramfs.cpio.gz \`\
+  `  -append "console=ttyAMA0 rdinit=/init" [-gdb tcp::1234 -S]`
