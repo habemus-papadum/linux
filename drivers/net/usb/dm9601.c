@@ -1,5 +1,5 @@
 /*
- * Davicom DM9601 USB 1.1 10/100Mbps ethernet devices
+ * Davicom DM96xx USB 10/100Mbps ethernet devices
  *
  * Peter Korsgaard <jacmet@sunsite.dk>
  *
@@ -13,7 +13,6 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/stddef.h>
-#include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -94,7 +93,8 @@ static int dm_write_reg(struct usbnet *dev, u8 reg, u8 value)
 				value, reg, NULL, 0);
 }
 
-static void dm_write_async(struct usbnet *dev, u8 reg, u16 length, void *data)
+static void dm_write_async(struct usbnet *dev, u8 reg, u16 length,
+			   const void *data)
 {
 	usbnet_write_cmd_async(dev, DM_WRITE_REGS,
 			       USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
@@ -222,13 +222,18 @@ static int dm9601_mdio_read(struct net_device *netdev, int phy_id, int loc)
 	struct usbnet *dev = netdev_priv(netdev);
 
 	__le16 res;
+	int err;
 
 	if (phy_id) {
 		netdev_dbg(dev->net, "Only internal phy supported\n");
 		return 0;
 	}
 
-	dm_read_shared_word(dev, 1, loc, &res);
+	err = dm_read_shared_word(dev, 1, loc, &res);
+	if (err < 0) {
+		netdev_err(dev->net, "MDIO read error: %d\n", err);
+		return 0;
+	}
 
 	netdev_dbg(dev->net,
 		   "dm9601_mdio_read() phy_id=0x%02x, loc=0x%02x, returns=0x%04x\n",
@@ -259,7 +264,6 @@ static void dm9601_get_drvinfo(struct net_device *net,
 {
 	/* Inherit standard device info */
 	usbnet_get_drvinfo(net, info);
-	info->eedump_len = DM_EEPROM_LEN;
 }
 
 static u32 dm9601_get_link(struct net_device *net)
@@ -283,9 +287,9 @@ static const struct ethtool_ops dm9601_ethtool_ops = {
 	.set_msglevel	= usbnet_set_msglevel,
 	.get_eeprom_len	= dm9601_get_eeprom_len,
 	.get_eeprom	= dm9601_get_eeprom,
-	.get_settings	= usbnet_get_settings,
-	.set_settings	= usbnet_set_settings,
 	.nway_reset	= usbnet_nway_reset,
+	.get_link_ksettings	= usbnet_get_link_ksettings_mii,
+	.set_link_ksettings	= usbnet_set_link_ksettings_mii,
 };
 
 static void dm9601_set_multicast(struct net_device *net)
@@ -303,7 +307,7 @@ static void dm9601_set_multicast(struct net_device *net)
 		rx_ctl |= 0x02;
 	} else if (net->flags & IFF_ALLMULTI ||
 		   netdev_mc_count(net) > DM_MAX_MCAST) {
-		rx_ctl |= 0x04;
+		rx_ctl |= 0x08;
 	} else if (!netdev_mc_empty(net)) {
 		struct netdev_hw_addr *ha;
 
@@ -333,7 +337,7 @@ static int dm9601_set_mac_address(struct net_device *net, void *p)
 		return -EINVAL;
 	}
 
-	memcpy(net->dev_addr, addr->sa_data, net->addr_len);
+	eth_hw_addr_set(net, addr->sa_data);
 	__dm9601_set_mac_address(dev);
 
 	return 0;
@@ -345,8 +349,9 @@ static const struct net_device_ops dm9601_netdev_ops = {
 	.ndo_start_xmit		= usbnet_start_xmit,
 	.ndo_tx_timeout		= usbnet_tx_timeout,
 	.ndo_change_mtu		= usbnet_change_mtu,
+	.ndo_get_stats64	= dev_get_tstats64,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_do_ioctl 		= dm9601_ioctl,
+	.ndo_eth_ioctl		= dm9601_ioctl,
 	.ndo_set_rx_mode	= dm9601_set_multicast,
 	.ndo_set_mac_address	= dm9601_set_mac_address,
 };
@@ -364,7 +369,12 @@ static int dm9601_bind(struct usbnet *dev, struct usb_interface *intf)
 	dev->net->ethtool_ops = &dm9601_ethtool_ops;
 	dev->net->hard_header_len += DM_TX_OVERHEAD;
 	dev->hard_mtu = dev->net->mtu + dev->net->hard_header_len;
-	dev->rx_urb_size = dev->net->mtu + ETH_HLEN + DM_RX_OVERHEAD;
+
+	/* dm9620/21a require room for 4 byte padding, even in dm9601
+	 * mode, so we need +1 to be able to receive full size
+	 * ethernet frames.
+	 */
+	dev->rx_urb_size = dev->net->mtu + ETH_HLEN + DM_RX_OVERHEAD + 1;
 
 	dev->mii.dev = dev->net;
 	dev->mii.mdio_read = dm9601_mdio_read;
@@ -387,7 +397,7 @@ static int dm9601_bind(struct usbnet *dev, struct usb_interface *intf)
 	 * Overwrite the auto-generated address only with good ones.
 	 */
 	if (is_valid_ether_addr(mac))
-		memcpy(dev->net->dev_addr, mac, ETH_ALEN);
+		eth_hw_addr_set(dev->net, mac);
 	else {
 		printk(KERN_WARNING
 			"dm9601: No valid MAC address in EEPROM, using %pM\n",
@@ -468,7 +478,7 @@ static int dm9601_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 static struct sk_buff *dm9601_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 				       gfp_t flags)
 {
-	int len;
+	int len, pad;
 
 	/* format:
 	   b1: packet length low
@@ -476,12 +486,23 @@ static struct sk_buff *dm9601_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 	   b3..n: packet data
 	*/
 
-	len = skb->len;
+	len = skb->len + DM_TX_OVERHEAD;
 
-	if (skb_headroom(skb) < DM_TX_OVERHEAD) {
+	/* workaround for dm962x errata with tx fifo getting out of
+	 * sync if a USB bulk transfer retry happens right after a
+	 * packet with odd / maxpacket length by adding up to 3 bytes
+	 * padding.
+	 */
+	while ((len & 1) || !(len % dev->maxpacket))
+		len++;
+
+	len -= DM_TX_OVERHEAD; /* hw header doesn't count as part of length */
+	pad = len - skb->len;
+
+	if (skb_headroom(skb) < DM_TX_OVERHEAD || skb_tailroom(skb) < pad) {
 		struct sk_buff *skb2;
 
-		skb2 = skb_copy_expand(skb, DM_TX_OVERHEAD, 0, flags);
+		skb2 = skb_copy_expand(skb, DM_TX_OVERHEAD, pad, flags);
 		dev_kfree_skb_any(skb);
 		skb = skb2;
 		if (!skb)
@@ -490,10 +511,10 @@ static struct sk_buff *dm9601_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 
 	__skb_push(skb, DM_TX_OVERHEAD);
 
-	/* usbnet adds padding if length is a multiple of packet size
-	   if so, adjust length value in header */
-	if ((skb->len % dev->maxpacket) == 0)
-		len++;
+	if (pad) {
+		memset(skb->data + skb->len, 0, pad);
+		__skb_put(skb, pad);
+	}
 
 	skb->data[0] = len;
 	skb->data[1] = len >> 8;
@@ -543,7 +564,7 @@ static int dm9601_link_reset(struct usbnet *dev)
 }
 
 static const struct driver_info dm9601_info = {
-	.description	= "Davicom DM9601 USB Ethernet",
+	.description	= "Davicom DM96xx USB 10/100 Ethernet",
 	.flags		= FLAG_ETHER | FLAG_LINK_INTR,
 	.bind		= dm9601_bind,
 	.rx_fixup	= dm9601_rx_fixup,
@@ -594,6 +615,26 @@ static const struct usb_device_id products[] = {
 	 USB_DEVICE(0x0a46, 0x9620),	/* DM9620 USB to Fast Ethernet Adapter */
 	 .driver_info = (unsigned long)&dm9601_info,
 	 },
+	{
+	 USB_DEVICE(0x0a46, 0x9621),	/* DM9621A USB to Fast Ethernet Adapter */
+	 .driver_info = (unsigned long)&dm9601_info,
+	},
+	{
+	 USB_DEVICE(0x0a46, 0x9622),	/* DM9622 USB to Fast Ethernet Adapter */
+	 .driver_info = (unsigned long)&dm9601_info,
+	},
+	{
+	 USB_DEVICE(0x0a46, 0x0269),	/* DM962OA USB to Fast Ethernet Adapter */
+	 .driver_info = (unsigned long)&dm9601_info,
+	},
+	{
+	 USB_DEVICE(0x0a46, 0x1269),	/* DM9621A USB to Fast Ethernet Adapter */
+	 .driver_info = (unsigned long)&dm9601_info,
+	},
+	{
+	 USB_DEVICE(0x0586, 0x3427),	/* ZyXEL Keenetic Plus DSL xDSL modem */
+	 .driver_info = (unsigned long)&dm9601_info,
+	},
 	{},			// END
 };
 
@@ -612,5 +653,5 @@ static struct usb_driver dm9601_driver = {
 module_usb_driver(dm9601_driver);
 
 MODULE_AUTHOR("Peter Korsgaard <jacmet@sunsite.dk>");
-MODULE_DESCRIPTION("Davicom DM9601 USB 1.1 ethernet devices");
+MODULE_DESCRIPTION("Davicom DM96xx USB 10/100 ethernet devices");
 MODULE_LICENSE("GPL");

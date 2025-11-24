@@ -339,8 +339,10 @@ struct ssp_completion_resp {
 	__le32	status;
 	__le32	param;
 	__le32	ssptag_rescv_rescpad;
+
+	/* Must be last --ends in a flexible-array member. */
 	struct ssp_response_iu  ssp_resp_iu;
-	__le32	residual_count;
+	/* __le32  residual_count; */
 } __attribute__((packed, aligned(4)));
 
 
@@ -434,11 +436,6 @@ struct task_abort_req {
 	u32	reserved[11];
 } __attribute__((packed, aligned(4)));
 
-/* These flags used for SSP SMP & SATA Abort */
-#define ABORT_MASK		0x3
-#define ABORT_SINGLE		0x0
-#define ABORT_ALL		0x1
-
 /**
  * brief the data structure of SSP SATA SMP Abort Response
  * use to describe SSP SMP & SATA Abort Response ( 64 bytes)
@@ -520,7 +517,7 @@ struct sata_start_req {
 	__le32	tag;
 	__le32	device_id;
 	__le32	data_len;
-	__le32	ncqtag_atap_dir_m;
+	__le32	retfis_ncqtag_atap_dir_m;
 	struct host_to_dev_fis	sata_fis;
 	u32	reserved1;
 	u32	reserved2;
@@ -805,6 +802,7 @@ struct set_dev_state_resp {
 #define IO_ABORT_IN_PROGRESS				0x40
 #define IO_ABORT_DELAYED				0x41
 #define IO_INVALID_LENGTH				0x42
+#define IO_FATAL_ERROR					0x51
 
 /* WARNING: This error code must always be the last number.
  * If you add error code, modify this code also
@@ -1027,5 +1025,8 @@ struct set_dev_state_resp {
 #define DEVREG_FAILURE_PORT_NOT_VALID_STATE		0x06
 #define DEVREG_FAILURE_DEVICE_TYPE_NOT_VALID		0x07
 
+#define GSM_BASE					0x4F0000
+#define SHIFT_REG_64K_MASK				0xffff0000
+#define SHIFT_REG_BIT_SHIFT				8
 #endif
 

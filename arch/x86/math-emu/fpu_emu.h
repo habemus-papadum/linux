@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*---------------------------------------------------------------------------+
  |  fpu_emu.h                                                                |
  |                                                                           |
@@ -19,7 +20,7 @@
  */
 #define PECULIAR_486
 
-#ifdef __ASSEMBLY__
+#ifdef __ASSEMBLER__
 #include "fpu_asm.h"
 #define	Const(x)	$##x
 #else
@@ -67,11 +68,11 @@
 
 #define FPU_Exception   Const(0x80000000)	/* Added to tag returns. */
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 #include "fpu_system.h"
 
-#include <asm/sigcontext.h>	/* for struct _fpstate */
+#include <uapi/asm/sigcontext.h>	/* for struct _fpstate */
 #include <asm/math_emu.h>
 #include <linux/linkage.h>
 
@@ -157,7 +158,7 @@ extern u_char const data_sizes_16[32];
 
 #define signbyte(a) (((u_char *)(a))[9])
 #define getsign(a) (signbyte(a) & 0x80)
-#define setsign(a,b) { if (b) signbyte(a) |= 0x80; else signbyte(a) &= 0x7f; }
+#define setsign(a,b) { if ((b) != 0) signbyte(a) |= 0x80; else signbyte(a) &= 0x7f; }
 #define copysign(a,b) { if (getsign(a)) signbyte(b) |= 0x80; \
                         else signbyte(b) &= 0x7f; }
 #define changesign(a) { signbyte(a) ^= 0x80; }
@@ -176,7 +177,7 @@ static inline void reg_copy(FPU_REG const *x, FPU_REG *y)
 #define setexponentpos(x,y) { (*(short *)&((x)->exp)) = \
   ((y) + EXTENDED_Ebias) & 0x7fff; }
 #define exponent16(x)         (*(short *)&((x)->exp))
-#define setexponent16(x,y)  { (*(short *)&((x)->exp)) = (y); }
+#define setexponent16(x,y)  { (*(short *)&((x)->exp)) = (u16)(y); }
 #define addexponent(x,y)    { (*(short *)&((x)->exp)) += (y); }
 #define stdexp(x)           { (*(short *)&((x)->exp)) += EXTENDED_Ebias; }
 
@@ -212,6 +213,6 @@ asmlinkage int FPU_round(FPU_REG *arg, unsigned int extent, int dummy,
 #include "fpu_proto.h"
 #endif
 
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 
 #endif /* _FPU_EMU_H_ */

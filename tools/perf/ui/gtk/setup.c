@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
 #include "gtk.h"
-#include "../../util/cache.h"
-#include "../../util/debug.h"
+#include <linux/compiler.h>
+#include "../util.h"
 
 extern struct perf_error_ops perf_gtk_eops;
 
@@ -8,7 +9,7 @@ int perf_gtk__init(void)
 {
 	perf_error__register(&perf_gtk_eops);
 	perf_gtk__init_helpline();
-	perf_gtk__init_progress();
+	gtk_ui_progress__init();
 	perf_gtk__init_hpp();
 
 	return gtk_init_check(NULL, NULL) ? 0 : -1;

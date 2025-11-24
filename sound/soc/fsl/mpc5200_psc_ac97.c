@@ -1,18 +1,14 @@
-/*
- * linux/sound/mpc5200-ac97.c -- AC97 support for the Freescale MPC52xx chip.
- *
- * Copyright (C) 2009 Jon Smirl, Digispeaker
- * Author: Jon Smirl <jonsmirl@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+// SPDX-License-Identifier: GPL-2.0
+//
+// linux/sound/mpc5200-ac97.c -- AC97 support for the Freescale MPC52xx chip.
+//
+// Copyright (C) 2009 Jon Smirl, Digispeaker
+// Author: Jon Smirl <jonsmirl@gmail.com>
 
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
-#include <linux/of_platform.h>
 #include <linux/delay.h>
+#include <linux/time.h>
 
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -24,7 +20,6 @@
 #include <asm/mpc52xx_psc.h>
 
 #include "mpc5200_dma.h"
-#include "mpc5200_psc_ac97.h"
 
 #define DRV_NAME "mpc5200-psc-ac97"
 
@@ -127,17 +122,16 @@ static void psc_ac97_cold_reset(struct snd_ac97 *ac97)
 
 	mutex_unlock(&psc_dma->mutex);
 
-	msleep(1);
+	usleep_range(1000, 2000);
 	psc_ac97_warm_reset(ac97);
 }
 
-struct snd_ac97_bus_ops soc_ac97_ops = {
+static struct snd_ac97_bus_ops psc_ac97_ops = {
 	.read		= psc_ac97_read,
 	.write		= psc_ac97_write,
 	.reset		= psc_ac97_cold_reset,
 	.warm_reset	= psc_ac97_warm_reset,
 };
-EXPORT_SYMBOL_GPL(soc_ac97_ops);
 
 static int psc_ac97_hw_analog_params(struct snd_pcm_substream *substream,
 				 struct snd_pcm_hw_params *params,
@@ -227,6 +221,7 @@ static int psc_ac97_probe(struct snd_soc_dai *cpu_dai)
  * psc_ac97_dai_template: template CPU Digital Audio Interface
  */
 static const struct snd_soc_dai_ops psc_ac97_analog_ops = {
+	.probe		= psc_ac97_probe,
 	.hw_params	= psc_ac97_hw_analog_params,
 	.trigger	= psc_ac97_trigger,
 };
@@ -238,8 +233,6 @@ static const struct snd_soc_dai_ops psc_ac97_digital_ops = {
 static struct snd_soc_dai_driver psc_ac97_dai[] = {
 {
 	.name = "mpc5200-psc-ac97.0",
-	.ac97_control = 1,
-	.probe	= psc_ac97_probe,
 	.playback = {
 		.stream_name	= "AC97 Playback",
 		.channels_min   = 1,
@@ -258,7 +251,6 @@ static struct snd_soc_dai_driver psc_ac97_dai[] = {
 },
 {
 	.name = "mpc5200-psc-ac97.1",
-	.ac97_control = 1,
 	.playback = {
 		.stream_name	= "AC97 SPDIF",
 		.channels_min   = 1,
@@ -283,12 +275,17 @@ static const struct snd_soc_component_driver psc_ac97_component = {
 static int psc_ac97_of_probe(struct platform_device *op)
 {
 	int rc;
-	struct snd_ac97 ac97;
 	struct mpc52xx_psc __iomem *regs;
 
 	rc = mpc5200_audio_dma_create(op);
 	if (rc != 0)
 		return rc;
+
+	rc = snd_soc_set_ac97_ops(&psc_ac97_ops);
+	if (rc != 0) {
+		dev_err(&op->dev, "Failed to set AC'97 ops: %d\n", rc);
+		return rc;
+	}
 
 	rc = snd_soc_register_component(&op->dev, &psc_ac97_component,
 					psc_ac97_dai, ARRAY_SIZE(psc_ac97_dai));
@@ -299,7 +296,6 @@ static int psc_ac97_of_probe(struct platform_device *op)
 
 	psc_dma = dev_get_drvdata(&op->dev);
 	regs = psc_dma->psc_regs;
-	ac97.private_data = psc_dma;
 
 	psc_dma->imr = 0;
 	out_be16(&psc_dma->psc_regs->isr_imr.imr, psc_dma->imr);
@@ -314,15 +310,15 @@ static int psc_ac97_of_probe(struct platform_device *op)
 	return 0;
 }
 
-static int psc_ac97_of_remove(struct platform_device *op)
+static void psc_ac97_of_remove(struct platform_device *op)
 {
 	mpc5200_audio_dma_destroy(op);
 	snd_soc_unregister_component(&op->dev);
-	return 0;
+	snd_soc_set_ac97_ops(NULL);
 }
 
 /* Match table for of_platform binding */
-static struct of_device_id psc_ac97_match[] = {
+static const struct of_device_id psc_ac97_match[] = {
 	{ .compatible = "fsl,mpc5200-psc-ac97", },
 	{ .compatible = "fsl,mpc5200b-psc-ac97", },
 	{}
@@ -334,7 +330,6 @@ static struct platform_driver psc_ac97_driver = {
 	.remove = psc_ac97_of_remove,
 	.driver = {
 		.name = "mpc5200-psc-ac97",
-		.owner = THIS_MODULE,
 		.of_match_table = psc_ac97_match,
 	},
 };

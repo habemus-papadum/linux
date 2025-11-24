@@ -60,8 +60,6 @@
 */
 
 #define DRV_NAME	"3c509"
-#define DRV_VERSION	"1.20"
-#define DRV_RELDATE	"04Feb2008"
 
 /* A few values that may be tweaked. */
 
@@ -88,11 +86,9 @@
 #include <linux/eisa.h>
 #include <linux/bitops.h>
 
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <asm/io.h>
 #include <asm/irq.h>
-
-static char version[] = DRV_NAME ".c:" DRV_VERSION " " DRV_RELDATE " becker@scyld.com\n";
 
 #ifdef EL3_DEBUG
 static int el3_debug = EL3_DEBUG;
@@ -196,7 +192,7 @@ static struct net_device_stats *el3_get_stats(struct net_device *dev);
 static int el3_rx(struct net_device *dev);
 static int el3_close(struct net_device *dev);
 static void set_multicast_list(struct net_device *dev);
-static void el3_tx_timeout (struct net_device *dev);
+static void el3_tx_timeout (struct net_device *dev, unsigned int txqueue);
 static void el3_down(struct net_device *dev);
 static void el3_up(struct net_device *dev);
 static const struct ethtool_ops ethtool_ops;
@@ -252,8 +248,7 @@ static int el3_isa_id_sequence(__be16 *phys_addr)
 		for (i = 0; i < el3_cards; i++) {
 			struct el3_private *lp = netdev_priv(el3_devs[i]);
 			if (lp->type == EL3_PNP &&
-			    !memcmp(phys_addr, el3_devs[i]->dev_addr,
-				    ETH_ALEN)) {
+			    ether_addr_equal((u8 *)phys_addr, el3_devs[i]->dev_addr)) {
 				if (el3_debug > 3)
 					pr_debug("3c509 with address %02x %02x %02x %02x %02x %02x was found by ISAPnP\n",
 						phys_addr[0] & 0xff, phys_addr[0] >> 8,
@@ -275,7 +270,7 @@ static void el3_dev_fill(struct net_device *dev, __be16 *phys_addr, int ioaddr,
 {
 	struct el3_private *lp = netdev_priv(dev);
 
-	memcpy(dev->dev_addr, phys_addr, ETH_ALEN);
+	eth_hw_addr_set(dev, (u8 *)phys_addr);
 	dev->base_addr = ioaddr;
 	dev->irq = irq;
 	dev->if_port = if_port;
@@ -307,7 +302,6 @@ static int el3_isa_match(struct device *pdev, unsigned int ndev)
 		return -ENOMEM;
 
 	SET_NETDEV_DEV(dev, pdev);
-	netdev_boot_setup_check(dev);
 
 	if (!request_region(ioaddr, EL3_IO_EXTENT, "3c509-isa")) {
 		free_netdev(dev);
@@ -340,12 +334,11 @@ static int el3_isa_match(struct device *pdev, unsigned int ndev)
 	return 1;
 }
 
-static int el3_isa_remove(struct device *pdev,
+static void el3_isa_remove(struct device *pdev,
 				    unsigned int ndev)
 {
 	el3_device_remove(pdev);
 	dev_set_drvdata(pdev, NULL);
-	return 0;
 }
 
 #ifdef CONFIG_PM
@@ -393,7 +386,7 @@ static struct isa_driver el3_isa_driver = {
 static int isa_registered;
 
 #ifdef CONFIG_PNP
-static struct pnp_device_id el3_pnp_ids[] = {
+static const struct pnp_device_id el3_pnp_ids[] = {
 	{ .id = "TCM5090" }, /* 3Com Etherlink III (TP) */
 	{ .id = "TCM5091" }, /* 3Com Etherlink III */
 	{ .id = "TCM5094" }, /* 3Com Etherlink III (combo) */
@@ -427,7 +420,6 @@ static int el3_pnp_probe(struct pnp_dev *pdev, const struct pnp_device_id *id)
 		return -ENOMEM;
 	}
 	SET_NETDEV_DEV(dev, &pdev->dev);
-	netdev_boot_setup_check(dev);
 
 	el3_dev_fill(dev, phys_addr, ioaddr, irq, if_port, EL3_PNP);
 	pnp_set_drvdata(pdev, dev);
@@ -475,7 +467,7 @@ static int pnp_registered;
 #endif /* CONFIG_PNP */
 
 #ifdef CONFIG_EISA
-static struct eisa_device_id el3_eisa_ids[] = {
+static const struct eisa_device_id el3_eisa_ids[] = {
 		{ "TCM5090" },
 		{ "TCM5091" },
 		{ "TCM5092" },
@@ -509,7 +501,6 @@ static const struct net_device_ops netdev_ops = {
 	.ndo_get_stats 		= el3_get_stats,
 	.ndo_set_rx_mode	= set_multicast_list,
 	.ndo_tx_timeout 	= el3_tx_timeout,
-	.ndo_change_mtu		= eth_change_mtu,
 	.ndo_set_mac_address 	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -521,7 +512,9 @@ static int el3_common_init(struct net_device *dev)
 {
 	struct el3_private *lp = netdev_priv(dev);
 	int err;
-	const char *if_names[] = {"10baseT", "AUI", "undefined", "BNC"};
+	static const char * const if_names[] = {
+		"10baseT", "AUI", "undefined", "BNC"
+	};
 
 	spin_lock_init(&lp->lock);
 
@@ -535,7 +528,7 @@ static int el3_common_init(struct net_device *dev)
 	/* The EL3-specific entries in the device structure. */
 	dev->netdev_ops = &netdev_ops;
 	dev->watchdog_timeo = TX_TIMEOUT;
-	SET_ETHTOOL_OPS(dev, &ethtool_ops);
+	dev->ethtool_ops = &ethtool_ops;
 
 	err = register_netdev(dev);
 	if (err) {
@@ -549,8 +542,6 @@ static int el3_common_init(struct net_device *dev)
 	       dev->name, dev->base_addr, if_names[(dev->if_port & 0x03)],
 	       dev->dev_addr, dev->irq);
 
-	if (el3_debug > 0)
-		pr_info("%s", version);
 	return 0;
 
 }
@@ -563,7 +554,7 @@ static void el3_common_remove (struct net_device *dev)
 }
 
 #ifdef CONFIG_EISA
-static int __init el3_eisa_probe (struct device *device)
+static int el3_eisa_probe(struct device *device)
 {
 	short i;
 	int ioaddr, irq, if_port;
@@ -597,7 +588,6 @@ static int __init el3_eisa_probe (struct device *device)
 	}
 
 	SET_NETDEV_DEV(dev, device);
-	netdev_boot_setup_check(dev);
 
 	el3_dev_fill(dev, phys_addr, ioaddr, irq, if_port, EL3_EISA);
 	eisa_set_drvdata (edev, dev);
@@ -691,16 +681,16 @@ el3_open(struct net_device *dev)
 }
 
 static void
-el3_tx_timeout (struct net_device *dev)
+el3_tx_timeout (struct net_device *dev, unsigned int txqueue)
 {
 	int ioaddr = dev->base_addr;
 
 	/* Transmitter timeout, serious problems. */
-	pr_warning("%s: transmit timed out, Tx_status %2.2x status %4.4x Tx FIFO room %d.\n",
-		   dev->name, inb(ioaddr + TX_STATUS), inw(ioaddr + EL3_STATUS),
-		   inw(ioaddr + TX_FREE));
+	pr_warn("%s: transmit timed out, Tx_status %2.2x status %4.4x Tx FIFO room %d\n",
+		dev->name, inb(ioaddr + TX_STATUS), inw(ioaddr + EL3_STATUS),
+		inw(ioaddr + TX_FREE));
 	dev->stats.tx_errors++;
-	dev->trans_start = jiffies; /* prevent tx timeout */
+	netif_trans_update(dev); /* prevent tx timeout */
 	/* Issue TX_RESET and TX_START commands. */
 	outw(TxReset, ioaddr + EL3_CMD);
 	outw(TxEnable, ioaddr + EL3_CMD);
@@ -723,25 +713,6 @@ el3_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		pr_debug("%s: el3_start_xmit(length = %u) called, status %4.4x.\n",
 			   dev->name, skb->len, inw(ioaddr + EL3_STATUS));
 	}
-#if 0
-#ifndef final_version
-	{	/* Error-checking code, delete someday. */
-		ushort status = inw(ioaddr + EL3_STATUS);
-		if (status & 0x0001 && 		/* IRQ line active, missed one. */
-		    inw(ioaddr + EL3_STATUS) & 1) { 			/* Make sure. */
-			pr_debug("%s: Missed interrupt, status then %04x now %04x"
-				   "  Tx %2.2x Rx %4.4x.\n", dev->name, status,
-				   inw(ioaddr + EL3_STATUS), inb(ioaddr + TX_STATUS),
-				   inw(ioaddr + RX_STATUS));
-			/* Fake interrupt trigger by masking, acknowledge interrupts. */
-			outw(SetStatusEnb | 0x00, ioaddr + EL3_CMD);
-			outw(AckIntr | IntLatch | TxAvailable | RxEarly | IntReq,
-				 ioaddr + EL3_CMD);
-			outw(SetStatusEnb | 0xff, ioaddr + EL3_CMD);
-		}
-	}
-#endif
-#endif
 	/*
 	 *	We lock the driver against other processors. Note
 	 *	we don't need to lock versus the IRQ as we suspended
@@ -769,7 +740,7 @@ el3_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	spin_unlock_irqrestore(&lp->lock, flags);
 
-	dev_kfree_skb (skb);
+	dev_consume_skb_any (skb);
 
 	/* Clear the Tx status stack. */
 	{
@@ -1060,68 +1031,69 @@ el3_link_ok(struct net_device *dev)
 	return tmp & (1<<11);
 }
 
-static int
-el3_netdev_get_ecmd(struct net_device *dev, struct ethtool_cmd *ecmd)
+static void
+el3_netdev_get_ecmd(struct net_device *dev, struct ethtool_link_ksettings *cmd)
 {
 	u16 tmp;
 	int ioaddr = dev->base_addr;
+	u32 supported;
 
 	EL3WINDOW(0);
 	/* obtain current transceiver via WN4_MEDIA? */
 	tmp = inw(ioaddr + WN0_ADDR_CONF);
-	ecmd->transceiver = XCVR_INTERNAL;
 	switch (tmp >> 14) {
 	case 0:
-		ecmd->port = PORT_TP;
+		cmd->base.port = PORT_TP;
 		break;
 	case 1:
-		ecmd->port = PORT_AUI;
-		ecmd->transceiver = XCVR_EXTERNAL;
+		cmd->base.port = PORT_AUI;
 		break;
 	case 3:
-		ecmd->port = PORT_BNC;
+		cmd->base.port = PORT_BNC;
+		break;
 	default:
 		break;
 	}
 
-	ecmd->duplex = DUPLEX_HALF;
-	ecmd->supported = 0;
+	cmd->base.duplex = DUPLEX_HALF;
+	supported = 0;
 	tmp = inw(ioaddr + WN0_CONF_CTRL);
 	if (tmp & (1<<13))
-		ecmd->supported |= SUPPORTED_AUI;
+		supported |= SUPPORTED_AUI;
 	if (tmp & (1<<12))
-		ecmd->supported |= SUPPORTED_BNC;
+		supported |= SUPPORTED_BNC;
 	if (tmp & (1<<9)) {
-		ecmd->supported |= SUPPORTED_TP | SUPPORTED_10baseT_Half |
+		supported |= SUPPORTED_TP | SUPPORTED_10baseT_Half |
 				SUPPORTED_10baseT_Full;	/* hmm... */
 		EL3WINDOW(4);
 		tmp = inw(ioaddr + WN4_NETDIAG);
 		if (tmp & FD_ENABLE)
-			ecmd->duplex = DUPLEX_FULL;
+			cmd->base.duplex = DUPLEX_FULL;
 	}
 
-	ethtool_cmd_speed_set(ecmd, SPEED_10);
+	ethtool_convert_legacy_u32_to_link_mode(cmd->link_modes.supported,
+						supported);
+	cmd->base.speed = SPEED_10;
 	EL3WINDOW(1);
-	return 0;
 }
 
 static int
-el3_netdev_set_ecmd(struct net_device *dev, struct ethtool_cmd *ecmd)
+el3_netdev_set_ecmd(struct net_device *dev,
+		    const struct ethtool_link_ksettings *cmd)
 {
 	u16 tmp;
 	int ioaddr = dev->base_addr;
 
-	if (ecmd->speed != SPEED_10)
+	if (cmd->base.speed != SPEED_10)
 		return -EINVAL;
-	if ((ecmd->duplex != DUPLEX_HALF) && (ecmd->duplex != DUPLEX_FULL))
-		return -EINVAL;
-	if ((ecmd->transceiver != XCVR_INTERNAL) && (ecmd->transceiver != XCVR_EXTERNAL))
+	if ((cmd->base.duplex != DUPLEX_HALF) &&
+	    (cmd->base.duplex != DUPLEX_FULL))
 		return -EINVAL;
 
 	/* change XCVR type */
 	EL3WINDOW(0);
 	tmp = inw(ioaddr + WN0_ADDR_CONF);
-	switch (ecmd->port) {
+	switch (cmd->base.port) {
 	case PORT_TP:
 		tmp &= ~(3<<14);
 		dev->if_port = 0;
@@ -1151,7 +1123,7 @@ el3_netdev_set_ecmd(struct net_device *dev, struct ethtool_cmd *ecmd)
 
 	EL3WINDOW(4);
 	tmp = inw(ioaddr + WN4_NETDIAG);
-	if (ecmd->duplex == DUPLEX_FULL)
+	if (cmd->base.duplex == DUPLEX_FULL)
 		tmp |= FD_ENABLE;
 	else
 		tmp &= ~FD_ENABLE;
@@ -1163,28 +1135,28 @@ el3_netdev_set_ecmd(struct net_device *dev, struct ethtool_cmd *ecmd)
 
 static void el3_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
 {
-	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
-	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
+	strscpy(info->driver, DRV_NAME, sizeof(info->driver));
 }
 
-static int el3_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+static int el3_get_link_ksettings(struct net_device *dev,
+				  struct ethtool_link_ksettings *cmd)
 {
 	struct el3_private *lp = netdev_priv(dev);
-	int ret;
 
 	spin_lock_irq(&lp->lock);
-	ret = el3_netdev_get_ecmd(dev, ecmd);
+	el3_netdev_get_ecmd(dev, cmd);
 	spin_unlock_irq(&lp->lock);
-	return ret;
+	return 0;
 }
 
-static int el3_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+static int el3_set_link_ksettings(struct net_device *dev,
+				  const struct ethtool_link_ksettings *cmd)
 {
 	struct el3_private *lp = netdev_priv(dev);
 	int ret;
 
 	spin_lock_irq(&lp->lock);
-	ret = el3_netdev_set_ecmd(dev, ecmd);
+	ret = el3_netdev_set_ecmd(dev, cmd);
 	spin_unlock_irq(&lp->lock);
 	return ret;
 }
@@ -1212,11 +1184,11 @@ static void el3_set_msglevel(struct net_device *dev, u32 v)
 
 static const struct ethtool_ops ethtool_ops = {
 	.get_drvinfo = el3_get_drvinfo,
-	.get_settings = el3_get_settings,
-	.set_settings = el3_set_settings,
 	.get_link = el3_get_link,
 	.get_msglevel = el3_get_msglevel,
 	.set_msglevel = el3_set_msglevel,
+	.get_link_ksettings = el3_get_link_ksettings,
+	.set_link_ksettings = el3_set_link_ksettings,
 };
 
 static void
@@ -1286,12 +1258,14 @@ el3_up(struct net_device *dev)
 					pr_cont("Forcing 3c5x9b full-duplex mode");
 					break;
 				}
+				fallthrough;
 			case 8:
 				/* set full-duplex mode based on eeprom config setting */
 				if ((sw_info & 0x000f) && (sw_info & 0x8000)) {
 					pr_cont("Setting 3c5x9b full-duplex mode (from EEPROM configuration bit)");
 					break;
 				}
+				fallthrough;
 			default:
 				/* xcvr=(0 || 4) OR user has an old 3c5x9 non "B" model */
 				pr_cont("Setting 3c5x9/3c5x9B half-duplex mode");
@@ -1389,7 +1363,7 @@ el3_resume(struct device *pdev)
 #endif /* CONFIG_PM */
 
 module_param(debug,int, 0);
-module_param_array(irq, int, NULL, 0);
+module_param_hw_array(irq, int, irq, NULL, 0);
 module_param(max_interrupt_work, int, 0);
 MODULE_PARM_DESC(debug, "debug level (0-6)");
 MODULE_PARM_DESC(irq, "IRQ number(s) (assigned)");

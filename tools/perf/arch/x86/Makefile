@@ -1,8 +1,3 @@
-ifndef NO_DWARF
-PERF_HAVE_DWARF_REGS := 1
-LIB_OBJS += $(OUTPUT)arch/$(ARCH)/util/dwarf-regs.o
-endif
-ifndef NO_LIBUNWIND
-LIB_OBJS += $(OUTPUT)arch/$(ARCH)/util/unwind.o
-endif
-LIB_OBJS += $(OUTPUT)arch/$(ARCH)/util/header.o
+# SPDX-License-Identifier: GPL-2.0
+HAVE_KVM_STAT_SUPPORT := 1
+PERF_HAVE_JITDUMP := 1

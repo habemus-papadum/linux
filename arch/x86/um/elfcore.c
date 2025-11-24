@@ -1,4 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0
 #include <linux/elf.h>
+#include <linux/elfcore.h>
 #include <linux/coredump.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -6,13 +8,12 @@
 #include <asm/elf.h>
 
 
-Elf32_Half elf_core_extra_phdrs(void)
+Elf32_Half elf_core_extra_phdrs(struct coredump_params *cprm)
 {
 	return vsyscall_ehdr ? (((struct elfhdr *)vsyscall_ehdr)->e_phnum) : 0;
 }
 
-int elf_core_write_extra_phdrs(struct file *file, loff_t offset, size_t *size,
-			       unsigned long limit)
+int elf_core_write_extra_phdrs(struct coredump_params *cprm, loff_t offset)
 {
 	if ( vsyscall_ehdr ) {
 		const struct elfhdr *const ehdrp =
@@ -32,17 +33,14 @@ int elf_core_write_extra_phdrs(struct file *file, loff_t offset, size_t *size,
 				phdr.p_offset += ofs;
 			}
 			phdr.p_paddr = 0; /* match other core phdrs */
-			*size += sizeof(phdr);
-			if (*size > limit
-			    || !dump_write(file, &phdr, sizeof(phdr)))
+			if (!dump_emit(cprm, &phdr, sizeof(phdr)))
 				return 0;
 		}
 	}
 	return 1;
 }
 
-int elf_core_write_extra_data(struct file *file, size_t *size,
-			      unsigned long limit)
+int elf_core_write_extra_data(struct coredump_params *cprm)
 {
 	if ( vsyscall_ehdr ) {
 		const struct elfhdr *const ehdrp =
@@ -55,10 +53,7 @@ int elf_core_write_extra_data(struct file *file, size_t *size,
 			if (phdrp[i].p_type == PT_LOAD) {
 				void *addr = (void *) phdrp[i].p_vaddr;
 				size_t filesz = phdrp[i].p_filesz;
-
-				*size += filesz;
-				if (*size > limit
-				    || !dump_write(file, addr, filesz))
+				if (!dump_emit(cprm, addr, filesz))
 					return 0;
 			}
 		}
@@ -66,7 +61,7 @@ int elf_core_write_extra_data(struct file *file, size_t *size,
 	return 1;
 }
 
-size_t elf_core_extra_data_size(void)
+size_t elf_core_extra_data_size(struct coredump_params *cprm)
 {
 	if ( vsyscall_ehdr ) {
 		const struct elfhdr *const ehdrp =

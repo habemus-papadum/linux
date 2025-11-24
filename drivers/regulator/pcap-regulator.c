@@ -1,12 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * PCAP2 Regulator Driver
  *
  * Copyright (c) 2009 Daniel Ribeiro <drwyrm@gmail.com>
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
  */
 
 #include <linux/kernel.h>
@@ -90,10 +86,6 @@ static const unsigned int SW1_table[] = {
 
 #define SW2_table SW1_table
 
-static const unsigned int SW3_table[] = {
-	4000000, 4500000, 5000000, 5500000,
-};
-
 struct pcap_regulator {
 	const u8 reg;
 	const u8 en;
@@ -113,7 +105,7 @@ struct pcap_regulator {
 		.lowpwr		= _lowpwr,				\
 	}
 
-static struct pcap_regulator vreg_table[] = {
+static const struct pcap_regulator vreg_table[] = {
 	VREG_INFO(V1,    PCAP_REG_VREG1,   1,  2,  18, 0),
 	VREG_INFO(V2,    PCAP_REG_VREG1,   5,  6,  19, 22),
 	VREG_INFO(V3,    PCAP_REG_VREG1,   7,  8,  20, 23),
@@ -149,7 +141,7 @@ static struct pcap_regulator vreg_table[] = {
 static int pcap_regulator_set_voltage_sel(struct regulator_dev *rdev,
 					  unsigned selector)
 {
-	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 
 	/* the regulator doesn't support voltage switching */
@@ -163,7 +155,7 @@ static int pcap_regulator_set_voltage_sel(struct regulator_dev *rdev,
 
 static int pcap_regulator_get_voltage_sel(struct regulator_dev *rdev)
 {
-	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 	u32 tmp;
 
@@ -177,7 +169,7 @@ static int pcap_regulator_get_voltage_sel(struct regulator_dev *rdev)
 
 static int pcap_regulator_enable(struct regulator_dev *rdev)
 {
-	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 
 	if (vreg->en == NA)
@@ -188,7 +180,7 @@ static int pcap_regulator_enable(struct regulator_dev *rdev)
 
 static int pcap_regulator_disable(struct regulator_dev *rdev)
 {
-	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 
 	if (vreg->en == NA)
@@ -199,7 +191,7 @@ static int pcap_regulator_disable(struct regulator_dev *rdev)
 
 static int pcap_regulator_is_enabled(struct regulator_dev *rdev)
 {
-	struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
+	const struct pcap_regulator *vreg = &vreg_table[rdev_get_id(rdev)];
 	void *pcap = rdev_get_drvdata(rdev);
 	u32 tmp;
 
@@ -210,7 +202,7 @@ static int pcap_regulator_is_enabled(struct regulator_dev *rdev)
 	return (tmp >> vreg->en) & 1;
 }
 
-static struct regulator_ops pcap_regulator_ops = {
+static const struct regulator_ops pcap_regulator_ops = {
 	.list_voltage	= regulator_list_voltage_table,
 	.set_voltage_sel = pcap_regulator_set_voltage_sel,
 	.get_voltage_sel = pcap_regulator_get_voltage_sel,
@@ -243,10 +235,11 @@ static int pcap_regulator_probe(struct platform_device *pdev)
 	struct regulator_config config = { };
 
 	config.dev = &pdev->dev;
-	config.init_data = pdev->dev.platform_data;
+	config.init_data = dev_get_platdata(&pdev->dev);
 	config.driver_data = pcap;
 
-	rdev = regulator_register(&pcap_regulators[pdev->id], &config);
+	rdev = devm_regulator_register(&pdev->dev, &pcap_regulators[pdev->id],
+				       &config);
 	if (IS_ERR(rdev))
 		return PTR_ERR(rdev);
 
@@ -255,23 +248,12 @@ static int pcap_regulator_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int pcap_regulator_remove(struct platform_device *pdev)
-{
-	struct regulator_dev *rdev = platform_get_drvdata(pdev);
-
-	regulator_unregister(rdev);
-	platform_set_drvdata(pdev, NULL);
-
-	return 0;
-}
-
 static struct platform_driver pcap_regulator_driver = {
 	.driver = {
 		.name	= "pcap-regulator",
-		.owner	= THIS_MODULE,
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe	= pcap_regulator_probe,
-	.remove	= pcap_regulator_remove,
 };
 
 static int __init pcap_regulator_init(void)

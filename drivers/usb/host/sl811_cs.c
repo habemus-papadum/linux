@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * PCMCIA driver for SL811HS (as found in REX-CFU1U)
  * Filename: sl811_cs.c
@@ -12,7 +13,6 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/init.h>
 #include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -94,7 +94,7 @@ static int sl811_hc_init(struct device *parent, resource_size_t base_addr,
 		return -EBUSY;
 	platform_dev.dev.parent = parent;
 
-	/* finish seting up the platform device */
+	/* finish setting up the platform device */
 	resources[0].start = irq;
 
 	resources[1].start = base_addr;

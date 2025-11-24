@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * omap_device headers
  *
@@ -8,10 +9,6 @@
  * Cousson, Kevin Hilman, Tony Lindgren, Rajendra Nayak, Vikram
  * Pandita, Sakari Poussa, Anand Sawant, Santosh Shilimkar, Richard
  * Woodruff
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  *
  * This type of functionality should be implemented as a proper
  * omap_bus/omap_device in Linux.
@@ -28,8 +25,6 @@
 
 #include "omap_hwmod.h"
 
-extern struct dev_pm_domain omap_device_pm_domain;
-
 /* omap_device._state values */
 #define OMAP_DEVICE_STATE_UNKNOWN	0
 #define OMAP_DEVICE_STATE_ENABLED	1
@@ -38,7 +33,6 @@ extern struct dev_pm_domain omap_device_pm_domain;
 
 /* omap_device.flags values */
 #define OMAP_DEVICE_SUSPENDED		BIT(0)
-#define OMAP_DEVICE_NO_IDLE_ON_SUSPEND	BIT(1)
 
 /**
  * struct omap_device - omap_device wrapper for platform_devices
@@ -69,26 +63,6 @@ struct omap_device {
 int omap_device_enable(struct platform_device *pdev);
 int omap_device_idle(struct platform_device *pdev);
 
-/* Core code interface */
-
-struct platform_device *omap_device_build(const char *pdev_name, int pdev_id,
-					  struct omap_hwmod *oh, void *pdata,
-					  int pdata_len);
-
-struct platform_device *omap_device_build_ss(const char *pdev_name, int pdev_id,
-					 struct omap_hwmod **oh, int oh_cnt,
-					 void *pdata, int pdata_len);
-
-struct omap_device *omap_device_alloc(struct platform_device *pdev,
-				      struct omap_hwmod **ohs, int oh_cnt);
-void omap_device_delete(struct omap_device *od);
-int omap_device_register(struct platform_device *pdev);
-
-struct device *omap_device_get_by_hwmod_name(const char *oh_name);
-
-/* OMAP PM interface */
-int omap_device_get_context_loss_count(struct platform_device *pdev);
-
 /* Other */
 
 int omap_device_assert_hardreset(struct platform_device *pdev,
@@ -101,13 +75,4 @@ static inline struct omap_device *to_omap_device(struct platform_device *pdev)
 {
 	return pdev ? pdev->archdata.od : NULL;
 }
-
-static inline
-void omap_device_disable_idle_on_suspend(struct platform_device *pdev)
-{
-	struct omap_device *od = to_omap_device(pdev);
-
-	od->flags |= OMAP_DEVICE_NO_IDLE_ON_SUSPEND;
-}
-
 #endif

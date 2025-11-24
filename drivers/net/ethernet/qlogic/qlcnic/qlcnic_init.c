@@ -1,8 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * QLogic qlcnic NIC Driver
  * Copyright (c) 2009-2013 QLogic Corporation
- *
- * See LICENSE.qlcnic for copyright and licensing details.
  */
 
 #include "qlcnic.h"
@@ -95,10 +94,8 @@ void qlcnic_release_rx_buffers(struct qlcnic_adapter *adapter)
 			if (rx_buf->skb == NULL)
 				continue;
 
-			pci_unmap_single(adapter->pdev,
-					rx_buf->dma,
-					rds_ring->dma_size,
-					PCI_DMA_FROMDEVICE);
+			dma_unmap_single(&adapter->pdev->dev, rx_buf->dma,
+					 rds_ring->dma_size, DMA_FROM_DEVICE);
 
 			dev_kfree_skb_any(rx_buf->skb);
 		}
@@ -127,27 +124,29 @@ void qlcnic_reset_rx_buffers_list(struct qlcnic_adapter *adapter)
 	}
 }
 
-void qlcnic_release_tx_buffers(struct qlcnic_adapter *adapter)
+void qlcnic_release_tx_buffers(struct qlcnic_adapter *adapter,
+			       struct qlcnic_host_tx_ring *tx_ring)
 {
 	struct qlcnic_cmd_buffer *cmd_buf;
 	struct qlcnic_skb_frag *buffrag;
 	int i, j;
-	struct qlcnic_host_tx_ring *tx_ring = adapter->tx_ring;
+
+	spin_lock(&tx_ring->tx_clean_lock);
 
 	cmd_buf = tx_ring->cmd_buf_arr;
 	for (i = 0; i < tx_ring->num_desc; i++) {
 		buffrag = cmd_buf->frag_array;
 		if (buffrag->dma) {
-			pci_unmap_single(adapter->pdev, buffrag->dma,
-					 buffrag->length, PCI_DMA_TODEVICE);
+			dma_unmap_single(&adapter->pdev->dev, buffrag->dma,
+					 buffrag->length, DMA_TO_DEVICE);
 			buffrag->dma = 0ULL;
 		}
-		for (j = 0; j < cmd_buf->frag_count; j++) {
+		for (j = 1; j < cmd_buf->frag_count; j++) {
 			buffrag++;
 			if (buffrag->dma) {
-				pci_unmap_page(adapter->pdev, buffrag->dma,
-					       buffrag->length,
-					       PCI_DMA_TODEVICE);
+				dma_unmap_page(&adapter->pdev->dev,
+					       buffrag->dma, buffrag->length,
+					       DMA_TO_DEVICE);
 				buffrag->dma = 0ULL;
 			}
 		}
@@ -157,6 +156,8 @@ void qlcnic_release_tx_buffers(struct qlcnic_adapter *adapter)
 		}
 		cmd_buf++;
 	}
+
+	spin_unlock(&tx_ring->tx_clean_lock);
 }
 
 void qlcnic_free_sw_resources(struct qlcnic_adapter *adapter)
@@ -236,12 +237,18 @@ int qlcnic_alloc_sw_resources(struct qlcnic_adapter *adapter)
 		spin_lock_init(&rds_ring->lock);
 	}
 
-	for (ring = 0; ring < adapter->max_sds_rings; ring++) {
+	for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
 		sds_ring = &recv_ctx->sds_rings[ring];
 		sds_ring->irq = adapter->msix_entries[ring].vector;
 		sds_ring->adapter = adapter;
 		sds_ring->num_desc = adapter->num_rxd;
-
+		if (qlcnic_82xx_check(adapter)) {
+			if (qlcnic_check_multi_tx(adapter) &&
+			    !adapter->ahw->diag_test)
+				sds_ring->tx_ring = &adapter->tx_ring[ring];
+			else
+				sds_ring->tx_ring = &adapter->tx_ring[0];
+		}
 		for (i = 0; i < NUM_RCV_DESC_RINGS; i++)
 			INIT_LIST_HEAD(&sds_ring->free_list[i]);
 	}
@@ -286,10 +293,11 @@ static int qlcnic_wait_rom_done(struct qlcnic_adapter *adapter)
 {
 	long timeout = 0;
 	long done = 0;
+	int err = 0;
 
 	cond_resched();
 	while (done == 0) {
-		done = QLCRD32(adapter, QLCNIC_ROMUSB_GLB_STATUS);
+		done = QLCRD32(adapter, QLCNIC_ROMUSB_GLB_STATUS, &err);
 		done &= 2;
 		if (++timeout >= QLCNIC_MAX_ROM_WAIT_USEC) {
 			dev_err(&adapter->pdev->dev,
@@ -304,6 +312,8 @@ static int qlcnic_wait_rom_done(struct qlcnic_adapter *adapter)
 static int do_rom_fast_read(struct qlcnic_adapter *adapter,
 			    u32 addr, u32 *valp)
 {
+	int err = 0;
+
 	QLCWR32(adapter, QLCNIC_ROMUSB_ROM_ADDRESS, addr);
 	QLCWR32(adapter, QLCNIC_ROMUSB_ROM_DUMMY_BYTE_CNT, 0);
 	QLCWR32(adapter, QLCNIC_ROMUSB_ROM_ABYTE_CNT, 3);
@@ -317,7 +327,9 @@ static int do_rom_fast_read(struct qlcnic_adapter *adapter,
 	udelay(10);
 	QLCWR32(adapter, QLCNIC_ROMUSB_ROM_DUMMY_BYTE_CNT, 0);
 
-	*valp = QLCRD32(adapter, QLCNIC_ROMUSB_ROM_RDATA);
+	*valp = QLCRD32(adapter, QLCNIC_ROMUSB_ROM_RDATA, &err);
+	if (err == -EIO)
+		return err;
 	return 0;
 }
 
@@ -369,11 +381,11 @@ int qlcnic_rom_fast_read(struct qlcnic_adapter *adapter, u32 addr, u32 *valp)
 
 int qlcnic_pinit_from_rom(struct qlcnic_adapter *adapter)
 {
-	int addr, val;
+	int addr, err = 0;
 	int i, n, init_delay;
 	struct crb_addr_pair *buf;
 	unsigned offset;
-	u32 off;
+	u32 off, val;
 	struct pci_dev *pdev = adapter->pdev;
 
 	QLC_SHARED_REG_WR32(adapter, QLCNIC_CMDPEG_STATE, 0);
@@ -402,7 +414,9 @@ int qlcnic_pinit_from_rom(struct qlcnic_adapter *adapter)
 	QLCWR32(adapter, QLCNIC_CRB_NIU + 0xb0000, 0x00);
 
 	/* halt sre */
-	val = QLCRD32(adapter, QLCNIC_CRB_SRE + 0x1000);
+	val = QLCRD32(adapter, QLCNIC_CRB_SRE + 0x1000, &err);
+	if (err == -EIO)
+		return err;
 	QLCWR32(adapter, QLCNIC_CRB_SRE + 0x1000, val & (~(0x1)));
 
 	/* halt epg */
@@ -423,7 +437,6 @@ int qlcnic_pinit_from_rom(struct qlcnic_adapter *adapter)
 	QLCWR32(adapter, QLCNIC_CRB_PEG_NET_4 + 0x3c, 1);
 	msleep(20);
 
-	qlcnic_rom_unlock(adapter);
 	/* big hammer don't reset CAM block on reset */
 	QLCWR32(adapter, QLCNIC_ROMUSB_GLB_SW_RESET, 0xfeffffff);
 
@@ -520,7 +533,7 @@ int qlcnic_pinit_from_rom(struct qlcnic_adapter *adapter)
 	QLCWR32(adapter, QLCNIC_CRB_PEG_NET_3 + 0xc, 0);
 	QLCWR32(adapter, QLCNIC_CRB_PEG_NET_4 + 0x8, 0);
 	QLCWR32(adapter, QLCNIC_CRB_PEG_NET_4 + 0xc, 0);
-	msleep(1);
+	usleep_range(1000, 1500);
 
 	QLC_SHARED_REG_WR32(adapter, QLCNIC_PEG_HALT_STATUS1, 0);
 	QLC_SHARED_REG_WR32(adapter, QLCNIC_PEG_HALT_STATUS2, 0);
@@ -575,13 +588,9 @@ qlcnic_receive_peg_ready(struct qlcnic_adapter *adapter)
 
 	} while (--retries);
 
-	if (!retries) {
-		dev_err(&adapter->pdev->dev, "Receive Peg initialization not "
-			      "complete, state: 0x%x.\n", val);
-		return -EIO;
-	}
-
-	return 0;
+	dev_err(&adapter->pdev->dev, "Receive Peg initialization not complete, state: 0x%x.\n",
+		val);
+	return -EIO;
 }
 
 int
@@ -719,10 +728,12 @@ qlcnic_check_flash_fw_ver(struct qlcnic_adapter *adapter)
 static int
 qlcnic_has_mn(struct qlcnic_adapter *adapter)
 {
-	u32 capability;
-	capability = 0;
+	u32 capability = 0;
+	int err = 0;
 
-	capability = QLCRD32(adapter, QLCNIC_PEG_TUNE_CAPABILITY);
+	capability = QLCRD32(adapter, QLCNIC_PEG_TUNE_CAPABILITY, &err);
+	if (err == -EIO)
+		return err;
 	if (capability & QLCNIC_PEG_TUNE_MN_PRESENT)
 		return 1;
 
@@ -1179,7 +1190,7 @@ qlcnic_load_firmware(struct qlcnic_adapter *adapter)
 			flashaddr += 8;
 		}
 	}
-	msleep(1);
+	usleep_range(1000, 1500);
 
 	QLCWR32(adapter, QLCNIC_CRB_PEG_NET_0 + 0x18, 0x1020);
 	QLCWR32(adapter, QLCNIC_ROMUSB_GLB_SW_RESET, 0x80001e);
@@ -1276,7 +1287,7 @@ next:
 		rc = qlcnic_validate_firmware(adapter);
 		if (rc != 0) {
 			release_firmware(adapter->fw);
-			msleep(1);
+			usleep_range(1000, 1500);
 			goto next;
 		}
 	}

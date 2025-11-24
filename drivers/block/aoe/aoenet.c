@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 Coraid, Inc.  See COPYING for GPL terms. */
+/* Copyright (c) 2013 Coraid, Inc.  See COPYING for GPL terms. */
 /*
  * aoenet.c
  * Ethernet portion of AoE driver
@@ -10,7 +10,7 @@
 #include <linux/netdevice.h>
 #include <linux/moduleparam.h>
 #include <net/net_namespace.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include "aoe.h"
 
 #define NECODES 5
@@ -39,8 +39,7 @@ static struct ktstate kts;
 #ifndef MODULE
 static int __init aoe_iflist_setup(char *str)
 {
-	strncpy(aoe_iflist, str, IFLISTSZ);
-	aoe_iflist[IFLISTSZ - 1] = '\0';
+	strscpy(aoe_iflist, str, IFLISTSZ);
 	return 1;
 }
 
@@ -52,7 +51,7 @@ static struct sk_buff_head skbtxq;
 
 /* enters with txlock held */
 static int
-tx(void) __must_hold(&txlock)
+tx(int id) __must_hold(&txlock)
 {
 	struct sk_buff *skb;
 	struct net_device *ifp;
@@ -64,6 +63,7 @@ tx(void) __must_hold(&txlock)
 			pr_warn("aoe: packet could not be sent on %s.  %s\n",
 				ifp ? ifp->name : "netif",
 				"consider increasing tx_queue_len");
+		dev_put(ifp);
 		spin_lock_irq(&txlock);
 	}
 	return 0;
@@ -205,7 +205,8 @@ aoenet_init(void)
 	kts.lock = &txlock;
 	kts.fn = tx;
 	kts.waitq = &txwq;
-	kts.name = "aoe_tx";
+	kts.id = 0;
+	snprintf(kts.name, sizeof(kts.name), "aoe_tx%d", kts.id);
 	if (aoe_ktstart(&kts))
 		return -EAGAIN;
 	dev_add_pack(&aoe_pt);

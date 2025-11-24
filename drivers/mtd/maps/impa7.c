@@ -1,11 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Handle mapping of the NOR flash on implementa A7 boards
  *
  * Copyright 2002 SYSGO Real-Time Solutions GmbH
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #include <linux/module.h>
@@ -47,7 +44,7 @@ static struct map_info impa7_map[NUM_FLASHBANKS] = {
 /*
  * MTD partitioning stuff
  */
-static struct mtd_partition partitions[] =
+static const struct mtd_partition partitions[] =
 {
 	{
 		.name = "FileSystem",
@@ -79,7 +76,7 @@ static int __init init_impa7(void)
 		}
 		simple_map_init(&impa7_map[i]);
 
-		impa7_mtd[i] = 0;
+		impa7_mtd[i] = NULL;
 		type = rom_probe_types;
 		for(; !impa7_mtd[i] && *type; type++) {
 			impa7_mtd[i] = do_map_probe(*type, &impa7_map[i]);
@@ -88,12 +85,11 @@ static int __init init_impa7(void)
 		if (impa7_mtd[i]) {
 			impa7_mtd[i]->owner = THIS_MODULE;
 			devicesfound++;
-			mtd_device_parse_register(impa7_mtd[i], NULL, NULL,
-						  partitions,
-						  ARRAY_SIZE(partitions));
+			mtd_device_register(impa7_mtd[i], partitions,
+					    ARRAY_SIZE(partitions));
+		} else {
+			iounmap((void __iomem *)impa7_map[i].virt);
 		}
-		else
-			iounmap((void *)impa7_map[i].virt);
 	}
 	return devicesfound == 0 ? -ENXIO : 0;
 }
@@ -105,8 +101,8 @@ static void __exit cleanup_impa7(void)
 		if (impa7_mtd[i]) {
 			mtd_device_unregister(impa7_mtd[i]);
 			map_destroy(impa7_mtd[i]);
-			iounmap((void *)impa7_map[i].virt);
-			impa7_map[i].virt = 0;
+			iounmap((void __iomem *)impa7_map[i].virt);
+			impa7_map[i].virt = NULL;
 		}
 	}
 }

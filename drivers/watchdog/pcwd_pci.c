@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  *	Berkshire PCI-PC Watchdog Card Driver
  *
@@ -9,11 +10,6 @@
  *	  Alan Cox <alan@lxorguk.ukuu.org.uk>,
  *	  Matt Domsch <Matt_Domsch@dell.com>,
  *	  Rob Radez <rob@osinvestor.com>
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License
- *	as published by the Free Software Foundation; either version
- *	2 of the License, or (at your option) any later version.
  *
  *	Neither Wim Van Sebroeck nor Iguana vzw. admit liability nor
  *	provide warranty for any of this software. This material is
@@ -40,7 +36,7 @@
 #include <linux/errno.h>	/* For the -ENODEV/... values */
 #include <linux/kernel.h>	/* For printk/panic/... */
 #include <linux/delay.h>	/* For mdelay function */
-#include <linux/miscdevice.h>	/* For MODULE_ALIAS_MISCDEV(WATCHDOG_MINOR) */
+#include <linux/miscdevice.h>	/* For struct miscdevice */
 #include <linux/watchdog.h>	/* For the watchdog specific items */
 #include <linux/notifier.h>	/* For notifier support */
 #include <linux/reboot.h>	/* For reboot_notifier stuff */
@@ -545,8 +541,8 @@ static long pcipcwd_ioctl(struct file *file, unsigned int cmd,
 			return -EINVAL;
 
 		pcipcwd_keepalive();
-		/* Fall */
 	}
+		fallthrough;
 
 	case WDIOC_GETTIMEOUT:
 		return put_user(heartbeat, p);
@@ -578,7 +574,7 @@ static int pcipcwd_open(struct inode *inode, struct file *file)
 	/* Activate */
 	pcipcwd_start();
 	pcipcwd_keepalive();
-	return nonseekable_open(inode, file);
+	return stream_open(inode, file);
 }
 
 static int pcipcwd_release(struct inode *inode, struct file *file)
@@ -620,7 +616,7 @@ static int pcipcwd_temp_open(struct inode *inode, struct file *file)
 	if (!pcipcwd_private.supports_temp)
 		return -ENODEV;
 
-	return nonseekable_open(inode, file);
+	return stream_open(inode, file);
 }
 
 static int pcipcwd_temp_release(struct inode *inode, struct file *file)
@@ -647,9 +643,9 @@ static int pcipcwd_notify_sys(struct notifier_block *this, unsigned long code,
 
 static const struct file_operations pcipcwd_fops = {
 	.owner =	THIS_MODULE,
-	.llseek =	no_llseek,
 	.write =	pcipcwd_write,
 	.unlocked_ioctl = pcipcwd_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.open =		pcipcwd_open,
 	.release =	pcipcwd_release,
 };
@@ -662,7 +658,6 @@ static struct miscdevice pcipcwd_miscdev = {
 
 static const struct file_operations pcipcwd_temp_fops = {
 	.owner =	THIS_MODULE,
-	.llseek =	no_llseek,
 	.read =		pcipcwd_temp_read,
 	.open =		pcipcwd_temp_open,
 	.release =	pcipcwd_temp_release,
@@ -801,7 +796,7 @@ static void pcipcwd_card_exit(struct pci_dev *pdev)
 	cards_found--;
 }
 
-static DEFINE_PCI_DEVICE_TABLE(pcipcwd_pci_tbl) = {
+static const struct pci_device_id pcipcwd_pci_tbl[] = {
 	{ PCI_VENDOR_ID_QUICKLOGIC, PCI_DEVICE_ID_WATCHDOG_PCIPCWD,
 		PCI_ANY_ID, PCI_ANY_ID, },
 	{ 0 },			/* End of list */
@@ -820,5 +815,3 @@ module_pci_driver(pcipcwd_driver);
 MODULE_AUTHOR("Wim Van Sebroeck <wim@iguana.be>");
 MODULE_DESCRIPTION("Berkshire PCI-PC Watchdog driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS_MISCDEV(WATCHDOG_MINOR);
-MODULE_ALIAS_MISCDEV(TEMP_MINOR);

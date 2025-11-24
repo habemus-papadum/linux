@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX_FS_STRUCT_H
 #define _LINUX_FS_STRUCT_H
 
@@ -7,12 +8,11 @@
 
 struct fs_struct {
 	int users;
-	spinlock_t lock;
-	seqcount_t seq;
+	seqlock_t seq;
 	int umask;
 	int in_exec;
 	struct path root, pwd;
-};
+} __randomize_layout;
 
 extern struct kmem_cache *fs_cachep;
 
@@ -25,29 +25,18 @@ extern int unshare_fs_struct(void);
 
 static inline void get_fs_root(struct fs_struct *fs, struct path *root)
 {
-	spin_lock(&fs->lock);
+	read_seqlock_excl(&fs->seq);
 	*root = fs->root;
 	path_get(root);
-	spin_unlock(&fs->lock);
+	read_sequnlock_excl(&fs->seq);
 }
 
 static inline void get_fs_pwd(struct fs_struct *fs, struct path *pwd)
 {
-	spin_lock(&fs->lock);
+	read_seqlock_excl(&fs->seq);
 	*pwd = fs->pwd;
 	path_get(pwd);
-	spin_unlock(&fs->lock);
-}
-
-static inline void get_fs_root_and_pwd(struct fs_struct *fs, struct path *root,
-				       struct path *pwd)
-{
-	spin_lock(&fs->lock);
-	*root = fs->root;
-	path_get(root);
-	*pwd = fs->pwd;
-	path_get(pwd);
-	spin_unlock(&fs->lock);
+	read_sequnlock_excl(&fs->seq);
 }
 
 extern bool current_chrooted(void);

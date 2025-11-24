@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * sysctl_net_llc.c: sysctl interface to LLC net subsystem.
  *
@@ -10,44 +11,35 @@
 #include <net/net_namespace.h>
 #include <net/llc.h>
 
-#ifndef CONFIG_SYSCTL
-#error This file should not be compiled without CONFIG_SYSCTL defined
-#endif
-
 static struct ctl_table llc2_timeout_table[] = {
 	{
 		.procname	= "ack",
 		.data		= &sysctl_llc2_ack_timeout,
-		.maxlen		= sizeof(long),
+		.maxlen		= sizeof(sysctl_llc2_ack_timeout),
 		.mode		= 0644,
 		.proc_handler   = proc_dointvec_jiffies,
 	},
 	{
 		.procname	= "busy",
 		.data		= &sysctl_llc2_busy_timeout,
-		.maxlen		= sizeof(long),
+		.maxlen		= sizeof(sysctl_llc2_busy_timeout),
 		.mode		= 0644,
 		.proc_handler   = proc_dointvec_jiffies,
 	},
 	{
 		.procname	= "p",
 		.data		= &sysctl_llc2_p_timeout,
-		.maxlen		= sizeof(long),
+		.maxlen		= sizeof(sysctl_llc2_p_timeout),
 		.mode		= 0644,
 		.proc_handler   = proc_dointvec_jiffies,
 	},
 	{
 		.procname	= "rej",
 		.data		= &sysctl_llc2_rej_timeout,
-		.maxlen		= sizeof(long),
+		.maxlen		= sizeof(sysctl_llc2_rej_timeout),
 		.mode		= 0644,
 		.proc_handler   = proc_dointvec_jiffies,
 	},
-	{ },
-};
-
-static struct ctl_table llc_station_table[] = {
-	{ },
 };
 
 static struct ctl_table_header *llc2_timeout_header;
@@ -55,8 +47,9 @@ static struct ctl_table_header *llc_station_header;
 
 int __init llc_sysctl_init(void)
 {
+	struct ctl_table empty[1] = {};
 	llc2_timeout_header = register_net_sysctl(&init_net, "net/llc/llc2/timeout", llc2_timeout_table);
-	llc_station_header = register_net_sysctl(&init_net, "net/llc/station", llc_station_table);
+	llc_station_header = register_net_sysctl_sz(&init_net, "net/llc/station", empty, 0);
 
 	if (!llc2_timeout_header || !llc_station_header) {
 		llc_sysctl_exit();

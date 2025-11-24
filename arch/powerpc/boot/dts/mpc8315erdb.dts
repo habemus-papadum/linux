@@ -1,15 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * MPC8315E RDB Device Tree Source
  *
  * Copyright 2007 Freescale Semiconductor Inc.
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
  */
 
 /dts-v1/;
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	compatible = "fsl,mpc8315erdb";
@@ -216,14 +213,12 @@
 					interrupt-parent = <&ipic>;
 					interrupts = <20 0x8>;
 					reg = <0x0>;
-					device_type = "ethernet-phy";
 				};
 
 				phy1: ethernet-phy@1 {
 					interrupt-parent = <&ipic>;
 					interrupts = <19 0x8>;
 					reg = <0x1>;
-					device_type = "ethernet-phy";
 				};
 
 				tbi0: tbi-phy@11 {
@@ -364,6 +359,15 @@
 			interrupt-parent = <&ipic>;
 			fsl,mpc8313-wakeup-timer = <&gtm1>;
 		};
+
+		gpio: gpio-controller@c00 {
+			compatible = "fsl,mpc8314-gpio";
+			reg = <0xc00 0x100>;
+			interrupts = <74 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-parent = <&ipic>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
 	};
 
 	pci0: pci@e0008500 {
@@ -474,7 +478,7 @@
 
 		hdd {
 			gpios = <&mcu_pio 1 0>;
-			linux,default-trigger = "ide-disk";
+			linux,default-trigger = "disk-activity";
 		};
 	};
 };

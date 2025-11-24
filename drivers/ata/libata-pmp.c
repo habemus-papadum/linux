@@ -1,10 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * libata-pmp.c - libata port multiplier support
  *
  * Copyright (c) 2007  SUSE Linux Products GmbH
  * Copyright (c) 2007  Tejun Heo <teheo@suse.de>
- *
- * This file is released under the GPLv2.
  */
 
 #include <linux/kernel.h>
@@ -16,9 +15,9 @@
 
 const struct ata_port_operations sata_pmp_port_ops = {
 	.inherits		= &sata_port_ops,
-	.pmp_prereset		= ata_std_prereset,
-	.pmp_hardreset		= sata_std_hardreset,
-	.pmp_postreset		= ata_std_postreset,
+	.pmp_reset.prereset	= ata_std_prereset,
+	.pmp_reset.hardreset	= sata_std_hardreset,
+	.pmp_reset.postreset	= ata_std_postreset,
 	.error_handler		= sata_pmp_error_handler,
 };
 
@@ -63,7 +62,7 @@ static unsigned int sata_pmp_read(struct ata_link *link, int reg, u32 *r_val)
  *	sata_pmp_write - write PMP register
  *	@link: link to write PMP register for
  *	@reg: register to write
- *	@r_val: value to write
+ *	@val: value to write
  *
  *	Write PMP register.
  *
@@ -289,24 +288,24 @@ static int sata_pmp_configure(struct ata_device *dev, int print_info)
 
 	/* Disable sending Early R_OK.
 	 * With "cached read" HDD testing and multiple ports busy on a SATA
-	 * host controller, 3726 PMP will very rarely drop a deferred
+	 * host controller, 3x26 PMP will very rarely drop a deferred
 	 * R_OK that was intended for the host. Symptom will be all
 	 * 5 drives under test will timeout, get reset, and recover.
 	 */
-	if (vendor == 0x1095 && devid == 0x3726) {
+	if (vendor == 0x1095 && (devid == 0x3726 || devid == 0x3826)) {
 		u32 reg;
 
 		err_mask = sata_pmp_read(&ap->link, PMP_GSCR_SII_POL, &reg);
 		if (err_mask) {
 			rc = -EIO;
-			reason = "failed to read Sil3726 Private Register";
+			reason = "failed to read Sil3x26 Private Register";
 			goto fail;
 		}
 		reg &= ~0x1;
 		err_mask = sata_pmp_write(&ap->link, PMP_GSCR_SII_POL, reg);
 		if (err_mask) {
 			rc = -EIO;
-			reason = "failed to write Sil3726 Private Register";
+			reason = "failed to write Sil3x26 Private Register";
 			goto fail;
 		}
 	}
@@ -340,7 +339,7 @@ static int sata_pmp_init_links (struct ata_port *ap, int nr_ports)
 	int i, err;
 
 	if (!pmp_link) {
-		pmp_link = kzalloc(sizeof(pmp_link[0]) * SATA_PMP_MAX_PORTS,
+		pmp_link = kcalloc(SATA_PMP_MAX_PORTS, sizeof(pmp_link[0]),
 				   GFP_NOIO);
 		if (!pmp_link)
 			return -ENOMEM;
@@ -383,15 +382,19 @@ static void sata_pmp_quirks(struct ata_port *ap)
 	u16 devid = sata_pmp_gscr_devid(gscr);
 	struct ata_link *link;
 
-	if (vendor == 0x1095 && devid == 0x3726) {
-		/* sil3726 quirks */
+	if (vendor == 0x1095 && (devid == 0x3726 || devid == 0x3826)) {
+		/* sil3x26 quirks */
 		ata_for_each_link(link, ap, EDGE) {
 			/* link reports offline after LPM */
 			link->flags |= ATA_LFLAG_NO_LPM;
 
-			/* Class code report is unreliable. */
+			/*
+			 * Class code report is unreliable and SRST times
+			 * out under certain configurations.
+			 */
 			if (link->pmp < 5)
-				link->flags |= ATA_LFLAG_ASSUME_ATA;
+				link->flags |= ATA_LFLAG_NO_SRST |
+					       ATA_LFLAG_ASSUME_ATA;
 
 			/* port 5 is for SEMB device and it doesn't like SRST */
 			if (link->pmp == 5)
@@ -399,20 +402,17 @@ static void sata_pmp_quirks(struct ata_port *ap)
 					       ATA_LFLAG_ASSUME_SEMB;
 		}
 	} else if (vendor == 0x1095 && devid == 0x4723) {
-		/* sil4723 quirks */
-		ata_for_each_link(link, ap, EDGE) {
-			/* link reports offline after LPM */
-			link->flags |= ATA_LFLAG_NO_LPM;
-
-			/* class code report is unreliable */
-			if (link->pmp < 2)
-				link->flags |= ATA_LFLAG_ASSUME_ATA;
-
-			/* the config device at port 2 locks up on SRST */
-			if (link->pmp == 2)
-				link->flags |= ATA_LFLAG_NO_SRST |
-					       ATA_LFLAG_ASSUME_ATA;
-		}
+		/*
+		 * sil4723 quirks
+		 *
+		 * Link reports offline after LPM.  Class code report is
+		 * unreliable.  SIMG PMPs never got SRST reliable and the
+		 * config device at port 2 locks up on SRST.
+		 */
+		ata_for_each_link(link, ap, EDGE)
+			link->flags |= ATA_LFLAG_NO_LPM |
+				       ATA_LFLAG_NO_SRST |
+				       ATA_LFLAG_ASSUME_ATA;
 	} else if (vendor == 0x1095 && devid == 0x4726) {
 		/* sil4726 quirks */
 		ata_for_each_link(link, ap, EDGE) {
@@ -446,8 +446,11 @@ static void sata_pmp_quirks(struct ata_port *ap)
 		 * otherwise.  Don't try hard to recover it.
 		 */
 		ap->pmp_link[ap->nr_pmp_links - 1].flags |= ATA_LFLAG_NO_RETRY;
-	} else if (vendor == 0x197b && devid == 0x2352) {
-		/* chip found in Thermaltake BlackX Duet, jmicron JMB350? */
+	} else if (vendor == 0x197b && (devid == 0x2352 || devid == 0x0325)) {
+		/*
+		 * 0x2352: found in Thermaltake BlackX Duet, jmicron JMB350?
+		 * 0x0325: jmicron JMB394.
+		 */
 		ata_for_each_link(link, ap, EDGE) {
 			/* SRST breaks detection and disks get misclassified
 			 * LPM disabled to avoid potential problems
@@ -455,6 +458,13 @@ static void sata_pmp_quirks(struct ata_port *ap)
 			link->flags |= ATA_LFLAG_NO_LPM |
 				       ATA_LFLAG_NO_SRST |
 				       ATA_LFLAG_ASSUME_ATA;
+		}
+	} else if (vendor == 0x11ab && devid == 0x4140) {
+		/* Marvell 4140 quirks */
+		ata_for_each_link(link, ap, EDGE) {
+			/* port 4 is for SEMB device and it doesn't like SRST */
+			if (link->pmp == 4)
+				link->flags |= ATA_LFLAG_DISABLED;
 		}
 	}
 }
@@ -638,11 +648,8 @@ static int sata_pmp_same_pmp(struct ata_device *dev, const u32 *new_gscr)
 static int sata_pmp_revalidate(struct ata_device *dev, unsigned int new_class)
 {
 	struct ata_link *link = dev->link;
-	struct ata_port *ap = link->ap;
-	u32 *gscr = (void *)ap->sector_buf;
+	u32 *gscr = (void *)dev->sector_buf;
 	int rc;
-
-	DPRINTK("ENTER\n");
 
 	ata_eh_about_to_do(link, NULL, ATA_EH_REVALIDATE);
 
@@ -676,12 +683,10 @@ static int sata_pmp_revalidate(struct ata_device *dev, unsigned int new_class)
 
 	ata_eh_done(link, NULL, ATA_EH_REVALIDATE);
 
-	DPRINTK("EXIT, rc=0\n");
 	return 0;
 
  fail:
 	ata_dev_err(dev, "PMP revalidation failed (errno=%d)\n", rc);
-	DPRINTK("EXIT, rc=%d\n", rc);
 	return rc;
 }
 
@@ -722,10 +727,7 @@ static int sata_pmp_revalidate_quick(struct ata_device *dev)
 /**
  *	sata_pmp_eh_recover_pmp - recover PMP
  *	@ap: ATA port PMP is attached to
- *	@prereset: prereset method (can be NULL)
- *	@softreset: softreset method
- *	@hardreset: hardreset method
- *	@postreset: postreset method (can be NULL)
+ *	@reset_ops: The set of reset operations to use
  *
  *	Recover PMP attached to @ap.  Recovery procedure is somewhat
  *	similar to that of ata_eh_recover() except that reset should
@@ -739,8 +741,7 @@ static int sata_pmp_revalidate_quick(struct ata_device *dev)
  *	0 on success, -errno on failure.
  */
 static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
-		ata_prereset_fn_t prereset, ata_reset_fn_t softreset,
-		ata_reset_fn_t hardreset, ata_postreset_fn_t postreset)
+				   struct ata_reset_operations *reset_ops)
 {
 	struct ata_link *link = &ap->link;
 	struct ata_eh_context *ehc = &link->eh_context;
@@ -749,10 +750,9 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 	int detach = 0, rc = 0;
 	int reval_failed = 0;
 
-	DPRINTK("ENTER\n");
-
 	if (dev->flags & ATA_DFLAG_DETACH) {
 		detach = 1;
+		rc = -ENODEV;
 		goto fail;
 	}
 
@@ -763,8 +763,7 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 		struct ata_link *tlink;
 
 		/* reset */
-		rc = ata_eh_reset(link, 0, prereset, softreset, hardreset,
-				  postreset);
+		rc = ata_eh_reset(link, 0, reset_ops);
 		if (rc) {
 			ata_link_err(link, "failed to reset PMP, giving up\n");
 			goto fail;
@@ -817,7 +816,6 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 	/* okay, PMP resurrected */
 	ehc->i.flags = 0;
 
-	DPRINTK("EXIT, rc=0\n");
 	return 0;
 
  fail:
@@ -827,7 +825,6 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 	else
 		ata_dev_disable(dev);
 
-	DPRINTK("EXIT, rc=%d\n", rc);
 	return rc;
 }
 
@@ -930,8 +927,7 @@ static int sata_pmp_eh_recover(struct ata_port *ap)
  retry:
 	/* PMP attached? */
 	if (!sata_pmp_attached(ap)) {
-		rc = ata_eh_recover(ap, ops->prereset, ops->softreset,
-				    ops->hardreset, ops->postreset, NULL);
+		rc = ata_eh_recover(ap, &ops->reset, NULL);
 		if (rc) {
 			ata_for_each_dev(dev, &ap->link, ALL)
 				ata_dev_disable(dev);
@@ -949,8 +945,7 @@ static int sata_pmp_eh_recover(struct ata_port *ap)
 	}
 
 	/* recover pmp */
-	rc = sata_pmp_eh_recover_pmp(ap, ops->prereset, ops->softreset,
-				     ops->hardreset, ops->postreset);
+	rc = sata_pmp_eh_recover_pmp(ap, &ops->reset);
 	if (rc)
 		goto pmp_fail;
 
@@ -976,8 +971,7 @@ static int sata_pmp_eh_recover(struct ata_port *ap)
 		goto pmp_fail;
 
 	/* recover links */
-	rc = ata_eh_recover(ap, ops->pmp_prereset, ops->pmp_softreset,
-			    ops->pmp_hardreset, ops->pmp_postreset, &link);
+	rc = ata_eh_recover(ap, &ops->pmp_reset, &link);
 	if (rc)
 		goto link_fail;
 

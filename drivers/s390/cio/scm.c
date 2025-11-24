@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Recognize and maintain s390 storage class memory.
  *
@@ -6,6 +7,7 @@
  */
 
 #include <linux/device.h>
+#include <linux/export.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -15,8 +17,6 @@
 #include "chsc.h"
 
 static struct device *scm_root;
-static struct eadm_ops *eadm_ops;
-static DEFINE_MUTEX(eadm_ops_mutex);
 
 #define to_scm_dev(n) container_of(n, struct scm_device, dev)
 #define	to_scm_drv(d) container_of(d, struct scm_driver, drv)
@@ -29,20 +29,21 @@ static int scmdev_probe(struct device *dev)
 	return scmdrv->probe ? scmdrv->probe(scmdev) : -ENODEV;
 }
 
-static int scmdev_remove(struct device *dev)
+static void scmdev_remove(struct device *dev)
 {
 	struct scm_device *scmdev = to_scm_dev(dev);
 	struct scm_driver *scmdrv = to_scm_drv(dev->driver);
 
-	return scmdrv->remove ? scmdrv->remove(scmdev) : -ENODEV;
+	if (scmdrv->remove)
+		scmdrv->remove(scmdev);
 }
 
-static int scmdev_uevent(struct device *dev, struct kobj_uevent_env *env)
+static int scmdev_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
 	return add_uevent_var(env, "MODALIAS=scm:scmdev");
 }
 
-static struct bus_type scm_bus_type = {
+static const struct bus_type scm_bus_type = {
 	.name  = "scm",
 	.probe = scmdev_probe,
 	.remove = scmdev_remove,
@@ -73,50 +74,7 @@ void scm_driver_unregister(struct scm_driver *scmdrv)
 }
 EXPORT_SYMBOL_GPL(scm_driver_unregister);
 
-int scm_get_ref(void)
-{
-	int ret = 0;
-
-	mutex_lock(&eadm_ops_mutex);
-	if (!eadm_ops || !try_module_get(eadm_ops->owner))
-		ret = -ENOENT;
-	mutex_unlock(&eadm_ops_mutex);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(scm_get_ref);
-
-void scm_put_ref(void)
-{
-	mutex_lock(&eadm_ops_mutex);
-	module_put(eadm_ops->owner);
-	mutex_unlock(&eadm_ops_mutex);
-}
-EXPORT_SYMBOL_GPL(scm_put_ref);
-
-void register_eadm_ops(struct eadm_ops *ops)
-{
-	mutex_lock(&eadm_ops_mutex);
-	eadm_ops = ops;
-	mutex_unlock(&eadm_ops_mutex);
-}
-EXPORT_SYMBOL_GPL(register_eadm_ops);
-
-void unregister_eadm_ops(struct eadm_ops *ops)
-{
-	mutex_lock(&eadm_ops_mutex);
-	eadm_ops = NULL;
-	mutex_unlock(&eadm_ops_mutex);
-}
-EXPORT_SYMBOL_GPL(unregister_eadm_ops);
-
-int scm_start_aob(struct aob *aob)
-{
-	return eadm_ops->eadm_start(aob);
-}
-EXPORT_SYMBOL_GPL(scm_start_aob);
-
-void scm_irq_handler(struct aob *aob, int error)
+void scm_irq_handler(struct aob *aob, blk_status_t error)
 {
 	struct aob_rq_header *aobrq = (void *) aob->request.data;
 	struct scm_device *scmdev = aobrq->scmdev;
@@ -134,7 +92,7 @@ static ssize_t show_##name(struct device *dev,				\
 	int ret;							\
 									\
 	device_lock(dev);						\
-	ret = sprintf(buf, "%u\n", scmdev->attrs.name);			\
+	ret = sysfs_emit(buf, "%u\n", scmdev->attrs.name);		\
 	device_unlock(dev);						\
 									\
 	return ret;							\
@@ -218,10 +176,10 @@ out:
 		kobject_uevent(&scmdev->dev.kobj, KOBJ_CHANGE);
 }
 
-static int check_address(struct device *dev, void *data)
+static int check_address(struct device *dev, const void *data)
 {
 	struct scm_device *scmdev = to_scm_dev(dev);
-	struct sale *sale = data;
+	const struct sale *sale = data;
 
 	return scmdev->address == sale->sa;
 }
@@ -271,7 +229,7 @@ int scm_update_information(void)
 	size_t num;
 	int ret;
 
-	scm_info = (void *)__get_free_page(GFP_KERNEL | GFP_DMA);
+	scm_info = (void *)__get_free_page(GFP_KERNEL);
 	if (!scm_info)
 		return -ENOMEM;
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
 *  HID driver for zydacron remote control
 *
@@ -5,10 +6,6 @@
 */
 
 /*
-* This program is free software; you can redistribute it and/or modify it
-* under the terms of the GNU General Public License as published by the Free
-* Software Foundation; either version 2 of the License, or (at your option)
-* any later version.
 */
 
 #include <linux/device.h>
@@ -27,7 +24,7 @@ struct zc_device {
 * Zydacron remote control has an invalid HID report descriptor,
 * that needs fixing before we can parse it.
 */
-static __u8 *zc_report_fixup(struct hid_device *hdev, __u8 *rdesc,
+static const __u8 *zc_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 	unsigned int *rsize)
 {
 	if (*rsize >= 253 &&
@@ -169,7 +166,7 @@ static int zc_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	int ret;
 	struct zc_device *zc;
 
-	zc = kzalloc(sizeof(*zc), GFP_KERNEL);
+	zc = devm_kzalloc(&hdev->dev, sizeof(*zc), GFP_KERNEL);
 	if (zc == NULL) {
 		hid_err(hdev, "can't alloc descriptor\n");
 		return -ENOMEM;
@@ -180,28 +177,16 @@ static int zc_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	ret = hid_parse(hdev);
 	if (ret) {
 		hid_err(hdev, "parse failed\n");
-		goto err_free;
+		return ret;
 	}
 
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
-		goto err_free;
+		return ret;
 	}
 
 	return 0;
-err_free:
-	kfree(zc);
-
-	return ret;
-}
-
-static void zc_remove(struct hid_device *hdev)
-{
-	struct zc_device *zc = hid_get_drvdata(hdev);
-
-	hid_hw_stop(hdev);
-	kfree(zc);
 }
 
 static const struct hid_device_id zc_devices[] = {
@@ -217,8 +202,8 @@ static struct hid_driver zc_driver = {
 	.input_mapping = zc_input_mapping,
 	.raw_event = zc_raw_event,
 	.probe = zc_probe,
-	.remove = zc_remove,
 };
 module_hid_driver(zc_driver);
 
+MODULE_DESCRIPTION("HID driver for zydacron remote control");
 MODULE_LICENSE("GPL");

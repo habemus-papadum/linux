@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * drivers/net/ethernet/ibm/emac/mal.c
  *
@@ -17,16 +18,13 @@
  *
  *      Armin Kuster <akuster@mvista.com>
  *      Copyright 2002 MontaVista Softare Inc.
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- *
  */
 
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/platform_device.h>
 
 #include "core.h"
 #include <asm/dcr-regs.h>
@@ -263,7 +261,9 @@ static inline void mal_schedule_poll(struct mal_instance *mal)
 {
 	if (likely(napi_schedule_prep(&mal->napi))) {
 		MAL_DBG2(mal, "schedule_poll" NL);
+		spin_lock(&mal->lock);
 		mal_disable_eob_irq(mal);
+		spin_unlock(&mal->lock);
 		__napi_schedule(&mal->napi);
 	} else
 		MAL_DBG2(mal, "already in poll" NL);
@@ -399,7 +399,7 @@ static int mal_poll(struct napi_struct *napi, int budget)
 	unsigned long flags;
 
 	MAL_DBG2(mal, "poll(%d)" NL, budget);
- again:
+
 	/* Process TX skbs */
 	list_for_each(l, &mal->poll_list) {
 		struct mal_commac *mc =
@@ -418,20 +418,20 @@ static int mal_poll(struct napi_struct *napi, int budget)
 		int n;
 		if (unlikely(test_bit(MAL_COMMAC_POLL_DISABLED, &mc->flags)))
 			continue;
-		n = mc->ops->poll_rx(mc->dev, budget);
+		n = mc->ops->poll_rx(mc->dev, budget - received);
 		if (n) {
 			received += n;
-			budget -= n;
-			if (budget <= 0)
-				goto more_work; // XXX What if this is the last one ?
+			if (received >= budget)
+				return budget;
 		}
 	}
 
-	/* We need to disable IRQs to protect from RXDE IRQ here */
-	spin_lock_irqsave(&mal->lock, flags);
-	__napi_complete(napi);
-	mal_enable_eob_irq(mal);
-	spin_unlock_irqrestore(&mal->lock, flags);
+	if (napi_complete_done(napi, received)) {
+		/* We need to disable IRQs to protect from RXDE IRQ here */
+		spin_lock_irqsave(&mal->lock, flags);
+		mal_enable_eob_irq(mal);
+		spin_unlock_irqrestore(&mal->lock, flags);
+	}
 
 	/* Check for "rotting" packet(s) */
 	list_for_each(l, &mal->poll_list) {
@@ -442,15 +442,12 @@ static int mal_poll(struct napi_struct *napi, int budget)
 		if (unlikely(mc->ops->peek_rx(mc->dev) ||
 			     test_bit(MAL_COMMAC_RX_STOPPED, &mc->flags))) {
 			MAL_DBG2(mal, "rotting packet" NL);
-			if (napi_reschedule(napi))
-				mal_disable_eob_irq(mal);
-			else
-				MAL_DBG2(mal, "already in poll list" NL);
-
-			if (budget > 0)
-				goto again;
-			else
+			if (!napi_schedule(napi))
 				goto more_work;
+
+			spin_lock_irqsave(&mal->lock, flags);
+			mal_disable_eob_irq(mal);
+			spin_unlock_irqrestore(&mal->lock, flags);
 		}
 		mc->ops->poll_tx(mc->dev);
 	}
@@ -527,7 +524,8 @@ static int mal_probe(struct platform_device *ofdev)
 	unsigned long irqflags;
 	irq_handler_t hdlr_serr, hdlr_txde, hdlr_rxde;
 
-	mal = kzalloc(sizeof(struct mal_instance), GFP_KERNEL);
+	mal = devm_kzalloc(&ofdev->dev, sizeof(struct mal_instance),
+			   GFP_KERNEL);
 	if (!mal)
 		return -ENOMEM;
 
@@ -542,8 +540,7 @@ static int mal_probe(struct platform_device *ofdev)
 		printk(KERN_ERR
 		       "mal%d: can't find MAL num-tx-chans property!\n",
 		       index);
-		err = -ENODEV;
-		goto fail;
+		return -ENODEV;
 	}
 	mal->num_tx_chans = prop[0];
 
@@ -552,8 +549,7 @@ static int mal_probe(struct platform_device *ofdev)
 		printk(KERN_ERR
 		       "mal%d: can't find MAL num-rx-chans property!\n",
 		       index);
-		err = -ENODEV;
-		goto fail;
+		return -ENODEV;
 	}
 	mal->num_rx_chans = prop[0];
 
@@ -561,15 +557,13 @@ static int mal_probe(struct platform_device *ofdev)
 	if (dcr_base == 0) {
 		printk(KERN_ERR
 		       "mal%d: can't find DCR resource!\n", index);
-		err = -ENODEV;
-		goto fail;
+		return -ENODEV;
 	}
 	mal->dcr_host = dcr_map(ofdev->dev.of_node, dcr_base, 0x100);
 	if (!DCR_MAP_OK(mal->dcr_host)) {
 		printk(KERN_ERR
 		       "mal%d: failed to map DCRs !\n", index);
-		err = -ENODEV;
-		goto fail;
+		return -ENODEV;
 	}
 
 	if (of_device_is_compatible(ofdev->dev.of_node, "ibm,mcmal-405ez")) {
@@ -578,41 +572,25 @@ static int mal_probe(struct platform_device *ofdev)
 		mal->features |= (MAL_FTR_CLEAR_ICINTSTAT |
 				MAL_FTR_COMMON_ERR_INT);
 #else
-		printk(KERN_ERR "%s: Support for 405EZ not enabled!\n",
-				ofdev->dev.of_node->full_name);
-		err = -ENODEV;
-		goto fail;
-#endif
-	}
-
-	mal->txeob_irq = irq_of_parse_and_map(ofdev->dev.of_node, 0);
-	mal->rxeob_irq = irq_of_parse_and_map(ofdev->dev.of_node, 1);
-	mal->serr_irq = irq_of_parse_and_map(ofdev->dev.of_node, 2);
-
-	if (mal_has_feature(mal, MAL_FTR_COMMON_ERR_INT)) {
-		mal->txde_irq = mal->rxde_irq = mal->serr_irq;
-	} else {
-		mal->txde_irq = irq_of_parse_and_map(ofdev->dev.of_node, 3);
-		mal->rxde_irq = irq_of_parse_and_map(ofdev->dev.of_node, 4);
-	}
-
-	if (mal->txeob_irq == NO_IRQ || mal->rxeob_irq == NO_IRQ ||
-	    mal->serr_irq == NO_IRQ || mal->txde_irq == NO_IRQ ||
-	    mal->rxde_irq == NO_IRQ) {
-		printk(KERN_ERR
-		       "mal%d: failed to map interrupts !\n", index);
+		printk(KERN_ERR "%pOF: Support for 405EZ not enabled!\n",
+				ofdev->dev.of_node);
 		err = -ENODEV;
 		goto fail_unmap;
+#endif
 	}
 
 	INIT_LIST_HEAD(&mal->poll_list);
 	INIT_LIST_HEAD(&mal->list);
 	spin_lock_init(&mal->lock);
 
-	init_dummy_netdev(&mal->dummy_dev);
+	mal->dummy_dev = alloc_netdev_dummy(0);
+	if (!mal->dummy_dev) {
+		err = -ENOMEM;
+		goto fail_unmap;
+	}
 
-	netif_napi_add(&mal->dummy_dev, &mal->napi, mal_poll,
-		       CONFIG_IBM_EMAC_POLL_WEIGHT);
+	netif_napi_add_weight(mal->dummy_dev, &mal->napi, mal_poll,
+			      CONFIG_IBM_EMAC_POLL_WEIGHT);
 
 	/* Load power-on reset defaults */
 	mal_reset(mal);
@@ -638,10 +616,10 @@ static int mal_probe(struct platform_device *ofdev)
 		(NUM_TX_BUFF * mal->num_tx_chans +
 		 NUM_RX_BUFF * mal->num_rx_chans);
 	mal->bd_virt = dma_alloc_coherent(&ofdev->dev, bd_size, &mal->bd_dma,
-					  GFP_KERNEL | __GFP_ZERO);
+					  GFP_KERNEL);
 	if (mal->bd_virt == NULL) {
 		err = -ENOMEM;
-		goto fail_unmap;
+		goto fail_dummy;
 	}
 
 	for (i = 0; i < mal->num_tx_chans; ++i)
@@ -654,75 +632,73 @@ static int mal_probe(struct platform_device *ofdev)
 			     sizeof(struct mal_descriptor) *
 			     mal_rx_bd_offset(mal, i));
 
+	mal->txeob_irq = platform_get_irq(ofdev, 0);
+	mal->rxeob_irq = platform_get_irq(ofdev, 1);
+	mal->serr_irq = platform_get_irq(ofdev, 2);
+
 	if (mal_has_feature(mal, MAL_FTR_COMMON_ERR_INT)) {
+		mal->txde_irq = mal->rxde_irq = mal->serr_irq;
 		irqflags = IRQF_SHARED;
 		hdlr_serr = hdlr_txde = hdlr_rxde = mal_int;
 	} else {
+		mal->txde_irq = platform_get_irq(ofdev, 3);
+		mal->rxde_irq = platform_get_irq(ofdev, 4);
 		irqflags = 0;
 		hdlr_serr = mal_serr;
 		hdlr_txde = mal_txde;
 		hdlr_rxde = mal_rxde;
 	}
 
-	err = request_irq(mal->serr_irq, hdlr_serr, irqflags, "MAL SERR", mal);
+	err = devm_request_irq(&ofdev->dev, mal->serr_irq, hdlr_serr, irqflags,
+			       "MAL SERR", mal);
 	if (err)
 		goto fail2;
-	err = request_irq(mal->txde_irq, hdlr_txde, irqflags, "MAL TX DE", mal);
+	err = devm_request_irq(&ofdev->dev, mal->txde_irq, hdlr_txde, irqflags,
+			       "MAL TX DE", mal);
 	if (err)
-		goto fail3;
-	err = request_irq(mal->txeob_irq, mal_txeob, 0, "MAL TX EOB", mal);
+		goto fail2;
+	err = devm_request_irq(&ofdev->dev, mal->txeob_irq, mal_txeob, 0,
+			       "MAL TX EOB", mal);
 	if (err)
-		goto fail4;
-	err = request_irq(mal->rxde_irq, hdlr_rxde, irqflags, "MAL RX DE", mal);
+		goto fail2;
+	err = devm_request_irq(&ofdev->dev, mal->rxde_irq, hdlr_rxde, irqflags,
+			       "MAL RX DE", mal);
 	if (err)
-		goto fail5;
-	err = request_irq(mal->rxeob_irq, mal_rxeob, 0, "MAL RX EOB", mal);
+		goto fail2;
+	err = devm_request_irq(&ofdev->dev, mal->rxeob_irq, mal_rxeob, 0,
+			       "MAL RX EOB", mal);
 	if (err)
-		goto fail6;
+		goto fail2;
 
 	/* Enable all MAL SERR interrupt sources */
-	if (mal->version == 2)
-		set_mal_dcrn(mal, MAL_IER, MAL2_IER_EVENTS);
-	else
-		set_mal_dcrn(mal, MAL_IER, MAL1_IER_EVENTS);
+	set_mal_dcrn(mal, MAL_IER, MAL_IER_EVENTS);
 
 	/* Enable EOB interrupt */
 	mal_enable_eob_irq(mal);
 
 	printk(KERN_INFO
-	       "MAL v%d %s, %d TX channels, %d RX channels\n",
-	       mal->version, ofdev->dev.of_node->full_name,
+	       "MAL v%d %pOF, %d TX channels, %d RX channels\n",
+	       mal->version, ofdev->dev.of_node,
 	       mal->num_tx_chans, mal->num_rx_chans);
 
 	/* Advertise this instance to the rest of the world */
 	wmb();
-	dev_set_drvdata(&ofdev->dev, mal);
-
-	mal_dbg_register(mal);
+	platform_set_drvdata(ofdev, mal);
 
 	return 0;
 
- fail6:
-	free_irq(mal->rxde_irq, mal);
- fail5:
-	free_irq(mal->txeob_irq, mal);
- fail4:
-	free_irq(mal->txde_irq, mal);
- fail3:
-	free_irq(mal->serr_irq, mal);
  fail2:
 	dma_free_coherent(&ofdev->dev, bd_size, mal->bd_virt, mal->bd_dma);
+ fail_dummy:
+	free_netdev(mal->dummy_dev);
  fail_unmap:
 	dcr_unmap(mal->dcr_host, 0x100);
- fail:
-	kfree(mal);
-
 	return err;
 }
 
-static int mal_remove(struct platform_device *ofdev)
+static void mal_remove(struct platform_device *ofdev)
 {
-	struct mal_instance *mal = dev_get_drvdata(&ofdev->dev);
+	struct mal_instance *mal = platform_get_drvdata(ofdev);
 
 	MAL_DBG(mal, "remove" NL);
 
@@ -735,29 +711,20 @@ static int mal_remove(struct platform_device *ofdev)
 		       "mal%d: commac list is not empty on remove!\n",
 		       mal->index);
 
-	dev_set_drvdata(&ofdev->dev, NULL);
-
-	free_irq(mal->serr_irq, mal);
-	free_irq(mal->txde_irq, mal);
-	free_irq(mal->txeob_irq, mal);
-	free_irq(mal->rxde_irq, mal);
-	free_irq(mal->rxeob_irq, mal);
-
 	mal_reset(mal);
 
-	mal_dbg_unregister(mal);
+	free_netdev(mal->dummy_dev);
+
+	dcr_unmap(mal->dcr_host, 0x100);
 
 	dma_free_coherent(&ofdev->dev,
 			  sizeof(struct mal_descriptor) *
-			  (NUM_TX_BUFF * mal->num_tx_chans +
-			   NUM_RX_BUFF * mal->num_rx_chans), mal->bd_virt,
-			  mal->bd_dma);
-	kfree(mal);
-
-	return 0;
+				  (NUM_TX_BUFF * mal->num_tx_chans +
+				   NUM_RX_BUFF * mal->num_rx_chans),
+			  mal->bd_virt, mal->bd_dma);
 }
 
-static struct of_device_id mal_platform_match[] =
+static const struct of_device_id mal_platform_match[] =
 {
 	{
 		.compatible	= "ibm,mcmal",
@@ -780,7 +747,6 @@ static struct of_device_id mal_platform_match[] =
 static struct platform_driver mal_of_driver = {
 	.driver = {
 		.name = "mcmal",
-		.owner = THIS_MODULE,
 		.of_match_table = mal_platform_match,
 	},
 	.probe = mal_probe,

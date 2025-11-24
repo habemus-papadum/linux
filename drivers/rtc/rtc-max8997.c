@@ -1,16 +1,12 @@
-/*
- * RTC driver for Maxim MAX8997
- *
- * Copyright (C) 2013 Samsung Electronics Co.Ltd
- *
- *  based on rtc-max8998.c
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
- *  option) any later version.
- *
- */
+// SPDX-License-Identifier: GPL-2.0+
+//
+// RTC driver for Maxim MAX8997
+//
+// Copyright (C) 2013 Samsung Electronics Co.Ltd
+//
+//  based on rtc-max8998.c
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/slab.h>
 #include <linux/rtc.h>
@@ -104,11 +100,11 @@ static int max8997_rtc_tm_to_data(struct rtc_time *tm, u8 *data)
 	data[RTC_WEEKDAY] = 1 << tm->tm_wday;
 	data[RTC_DATE] = tm->tm_mday;
 	data[RTC_MONTH] = tm->tm_mon + 1;
-	data[RTC_YEAR] = tm->tm_year > 100 ? (tm->tm_year - 100) : 0 ;
+	data[RTC_YEAR] = tm->tm_year > 100 ? (tm->tm_year - 100) : 0;
 
 	if (tm->tm_year < 100) {
-		pr_warn("%s: MAX8997 RTC cannot handle the year %d."
-			"Assume it's 2000.\n", __func__, 1900 + tm->tm_year);
+		pr_warn("RTC cannot handle the year %d.  Assume it's 2000.\n",
+			1900 + tm->tm_year);
 		return -EINVAL;
 	}
 	return 0;
@@ -151,7 +147,7 @@ static int max8997_rtc_read_time(struct device *dev, struct rtc_time *tm)
 
 	max8997_rtc_data_to_tm(data, tm, info->rtc_24hr_mode);
 
-	return rtc_valid_tm(tm);
+	return 0;
 }
 
 static int max8997_rtc_set_time(struct device *dev, struct rtc_time *tm)
@@ -219,7 +215,7 @@ static int max8997_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alrm)
 
 out:
 	mutex_unlock(&info->lock);
-	return 0;
+	return ret;
 }
 
 static int max8997_rtc_stop_alarm(struct max8997_rtc_info *info)
@@ -424,7 +420,7 @@ static void max8997_rtc_enable_smpl(struct max8997_rtc_info *info, bool enable)
 
 	val = 0;
 	max8997_read_reg(info->rtc, MAX8997_RTC_WTSR_SMPL, &val);
-	pr_info("%s: WTSR_SMPL(0x%02x)\n", __func__, val);
+	pr_info("WTSR_SMPL(0x%02x)\n", val);
 }
 
 static int max8997_rtc_init_reg(struct max8997_rtc_info *info)
@@ -477,7 +473,7 @@ static int max8997_rtc_probe(struct platform_device *pdev)
 	max8997_rtc_enable_wtsr(info, true);
 	max8997_rtc_enable_smpl(info, true);
 
-	device_init_wakeup(&pdev->dev, 1);
+	device_init_wakeup(&pdev->dev, true);
 
 	info->rtc_dev = devm_rtc_device_register(&pdev->dev, "max8997-rtc",
 					&max8997_rtc_ops, THIS_MODULE);
@@ -507,11 +503,6 @@ err_out:
 	return ret;
 }
 
-static int max8997_rtc_remove(struct platform_device *pdev)
-{
-	return 0;
-}
-
 static void max8997_rtc_shutdown(struct platform_device *pdev)
 {
 	struct max8997_rtc_info *info = platform_get_drvdata(pdev);
@@ -524,14 +515,13 @@ static const struct platform_device_id rtc_id[] = {
 	{ "max8997-rtc", 0 },
 	{},
 };
+MODULE_DEVICE_TABLE(platform, rtc_id);
 
 static struct platform_driver max8997_rtc_driver = {
 	.driver		= {
 		.name	= "max8997-rtc",
-		.owner	= THIS_MODULE,
 	},
 	.probe		= max8997_rtc_probe,
-	.remove		= max8997_rtc_remove,
 	.shutdown	= max8997_rtc_shutdown,
 	.id_table	= rtc_id,
 };

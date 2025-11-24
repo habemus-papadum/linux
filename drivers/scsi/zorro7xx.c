@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Detection routine for the NCR53c710 based Amiga SCSI Controllers for Linux.
  *		Amiga MacroSystemUS WarpEngine SCSI controller.
@@ -104,7 +105,7 @@ static int zorro7xx_init_one(struct zorro_dev *z,
 	if (ioaddr > 0x01000000)
 		hostdata->base = ioremap(ioaddr, zorro_resource_len(z));
 	else
-		hostdata->base = (void __iomem *)ZTWO_VADDR(ioaddr);
+		hostdata->base = ZTWO_VADDR(ioaddr);
 
 	hostdata->clock = 50;
 	hostdata->chip710 = 1;
@@ -158,6 +159,8 @@ static void zorro7xx_remove_one(struct zorro_dev *z)
 	scsi_remove_host(host);
 
 	NCR_700_release(host);
+	if (host->base > 0x01000000)
+		iounmap(hostdata->base);
 	kfree(hostdata);
 	free_irq(host->irq, host);
 	zorro_release_device(z);

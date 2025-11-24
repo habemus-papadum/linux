@@ -1,21 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) ST-Ericsson SA 2012
  *
  * Author: Ola Lilja <ola.o.lilja@stericsson.com>,
  *         Kristoffer Karlsson <kristoffer.karlsson@stericsson.com>
  *         for ST-Ericsson.
- *
- * License terms:
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as published
- * by the Free Software Foundation.
  */
 
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/clk.h>
+#include <linux/mutex.h>
 
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
@@ -24,6 +20,7 @@
 
 #include "ux500_pcm.h"
 #include "ux500_msp_dai.h"
+#include "mop500_ab8500.h"
 #include "../codecs/ab8500-codec.h"
 
 #define TX_SLOT_MONO	0x0008
@@ -42,6 +39,12 @@
 /* Slot configuration */
 static unsigned int tx_slots = DEF_TX_SLOTS;
 static unsigned int rx_slots = DEF_RX_SLOTS;
+
+/* Configuration consistency parameters */
+static DEFINE_MUTEX(mop500_ab8500_params_lock);
+static unsigned long mop500_ab8500_usage;
+static int mop500_ab8500_rate;
+static int mop500_ab8500_channels;
 
 /* Clocks */
 static const char * const enum_mclk[] = {
@@ -125,9 +128,9 @@ static int mop500_ab8500_set_mclk(struct device *dev,
 static int mclk_input_control_get(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct mop500_ab8500_drvdata *drvdata =
-				snd_soc_card_get_drvdata(codec->card);
+				snd_soc_card_get_drvdata(card);
 
 	ucontrol->value.enumerated.item[0] = drvdata->mclk_sel;
 
@@ -137,9 +140,9 @@ static int mclk_input_control_get(struct snd_kcontrol *kcontrol,
 static int mclk_input_control_put(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct mop500_ab8500_drvdata *drvdata =
-				snd_soc_card_get_drvdata(codec->card);
+				snd_soc_card_get_drvdata(card);
 	unsigned int val = ucontrol->value.enumerated.item[0];
 
 	if (val > (unsigned int)MCLK_ULPCLK)
@@ -160,16 +163,6 @@ static struct snd_kcontrol_new mop500_ab8500_ctrls[] = {
 	SOC_ENUM_EXT("Master Clock Select",
 		soc_enum_mclk,
 		mclk_input_control_get, mclk_input_control_put),
-	/* Digital interface - Clocks */
-	SOC_SINGLE("Digital Interface Master Generator Switch",
-		AB8500_DIGIFCONF1, AB8500_DIGIFCONF1_ENMASTGEN,
-		1, 0),
-	SOC_SINGLE("Digital Interface 0 Bit-clock Switch",
-		AB8500_DIGIFCONF1, AB8500_DIGIFCONF1_ENFSBITCLK0,
-		1, 0),
-	SOC_SINGLE("Digital Interface 1 Bit-clock Switch",
-		AB8500_DIGIFCONF1, AB8500_DIGIFCONF1_ENFSBITCLK1,
-		1, 0),
 	SOC_DAPM_PIN_SWITCH("Headset Left"),
 	SOC_DAPM_PIN_SWITCH("Headset Right"),
 	SOC_DAPM_PIN_SWITCH("Earpiece"),
@@ -193,18 +186,18 @@ static struct snd_kcontrol_new mop500_ab8500_ctrls[] = {
 
 /* ASoC */
 
-int mop500_ab8500_startup(struct snd_pcm_substream *substream)
+static int mop500_ab8500_startup(struct snd_pcm_substream *substream)
 {
-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 
 	/* Set audio-clock source */
 	return mop500_ab8500_set_mclk(rtd->card->dev,
 				snd_soc_card_get_drvdata(rtd->card));
 }
 
-void mop500_ab8500_shutdown(struct snd_pcm_substream *substream)
+static void mop500_ab8500_shutdown(struct snd_pcm_substream *substream)
 {
-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct device *dev = rtd->card->dev;
 
 	dev_dbg(dev, "%s: Enter\n", __func__);
@@ -216,12 +209,12 @@ void mop500_ab8500_shutdown(struct snd_pcm_substream *substream)
 		rx_slots = DEF_RX_SLOTS;
 }
 
-int mop500_ab8500_hw_params(struct snd_pcm_substream *substream,
+static int mop500_ab8500_hw_params(struct snd_pcm_substream *substream,
 			struct snd_pcm_hw_params *params)
 {
-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_dai *codec_dai = rtd->codec_dai;
-	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct device *dev = rtd->card->dev;
 	unsigned int fmt;
 	int channels, ret = 0, driver_mode, slots;
@@ -239,6 +232,21 @@ int mop500_ab8500_hw_params(struct snd_pcm_substream *substream,
 		substream->pcm->id,
 		substream->name,
 		substream->number);
+
+	/* Ensure configuration consistency between DAIs */
+	mutex_lock(&mop500_ab8500_params_lock);
+	if (mop500_ab8500_usage) {
+		if (mop500_ab8500_rate != params_rate(params) ||
+		    mop500_ab8500_channels != params_channels(params)) {
+			mutex_unlock(&mop500_ab8500_params_lock);
+			return -EBUSY;
+		}
+	} else {
+		mop500_ab8500_rate = params_rate(params);
+		mop500_ab8500_channels = params_channels(params);
+	}
+	__set_bit(cpu_dai->id, &mop500_ab8500_usage);
+	mutex_unlock(&mop500_ab8500_params_lock);
 
 	channels = params_channels(params);
 
@@ -267,31 +275,19 @@ int mop500_ab8500_hw_params(struct snd_pcm_substream *substream,
 
 	if (driver_mode == DRIVERMODE_NORMAL) {
 		fmt = SND_SOC_DAIFMT_DSP_A |
-			SND_SOC_DAIFMT_CBM_CFM |
+			SND_SOC_DAIFMT_CBP_CFP |
 			SND_SOC_DAIFMT_NB_NF |
 			SND_SOC_DAIFMT_CONT;
 	} else {
 		fmt = SND_SOC_DAIFMT_DSP_A |
-			SND_SOC_DAIFMT_CBM_CFM |
+			SND_SOC_DAIFMT_CBP_CFP |
 			SND_SOC_DAIFMT_NB_NF |
 			SND_SOC_DAIFMT_GATED;
 	}
 
-	ret = snd_soc_dai_set_fmt(codec_dai, fmt);
-	if (ret < 0) {
-		dev_err(dev,
-			"%s: ERROR: snd_soc_dai_set_fmt failed for codec_dai (ret = %d)!\n",
-			__func__, ret);
+	ret = snd_soc_runtime_set_dai_fmt(rtd, fmt);
+	if (ret)
 		return ret;
-	}
-
-	ret = snd_soc_dai_set_fmt(cpu_dai, fmt);
-	if (ret < 0) {
-		dev_err(dev,
-			"%s: ERROR: snd_soc_dai_set_fmt failed for cpu_dai (ret = %d)!\n",
-			__func__, ret);
-		return ret;
-	}
 
 	/* Setup TDM-slots */
 
@@ -338,9 +334,22 @@ int mop500_ab8500_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-struct snd_soc_ops mop500_ab8500_ops[] = {
+static int mop500_ab8500_hw_free(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	mutex_lock(&mop500_ab8500_params_lock);
+	__clear_bit(cpu_dai->id, &mop500_ab8500_usage);
+	mutex_unlock(&mop500_ab8500_params_lock);
+
+	return 0;
+}
+
+const struct snd_soc_ops mop500_ab8500_ops[] = {
 	{
 		.hw_params = mop500_ab8500_hw_params,
+		.hw_free = mop500_ab8500_hw_free,
 		.startup = mop500_ab8500_startup,
 		.shutdown = mop500_ab8500_shutdown,
 	}
@@ -348,7 +357,7 @@ struct snd_soc_ops mop500_ab8500_ops[] = {
 
 int mop500_ab8500_machine_init(struct snd_soc_pcm_runtime *rtd)
 {
-	struct snd_soc_codec *codec = rtd->codec;
+	struct snd_soc_dapm_context *dapm = &rtd->card->dapm;
 	struct device *dev = rtd->card->dev;
 	struct mop500_ab8500_drvdata *drvdata;
 	int ret;
@@ -358,6 +367,10 @@ int mop500_ab8500_machine_init(struct snd_soc_pcm_runtime *rtd)
 	/* Create driver private-data struct */
 	drvdata = devm_kzalloc(dev, sizeof(struct mop500_ab8500_drvdata),
 			GFP_KERNEL);
+
+	if (!drvdata)
+		return -ENOMEM;
+
 	snd_soc_card_set_drvdata(rtd->card, drvdata);
 
 	/* Setup clocks */
@@ -385,7 +398,7 @@ int mop500_ab8500_machine_init(struct snd_soc_pcm_runtime *rtd)
 	drvdata->mclk_sel = MCLK_ULPCLK;
 
 	/* Add controls */
-	ret = snd_soc_add_codec_controls(codec, mop500_ab8500_ctrls,
+	ret = snd_soc_add_card_controls(rtd->card, mop500_ab8500_ctrls,
 			ARRAY_SIZE(mop500_ab8500_ctrls));
 	if (ret < 0) {
 		pr_err("%s: Failed to add machine-controls (%d)!\n",
@@ -393,23 +406,23 @@ int mop500_ab8500_machine_init(struct snd_soc_pcm_runtime *rtd)
 		return ret;
 	}
 
-	ret = snd_soc_dapm_disable_pin(&codec->dapm, "Earpiece");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "Speaker Left");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "Speaker Right");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "LineOut Left");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "LineOut Right");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "Vibra 1");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "Vibra 2");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "Mic 1");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "Mic 2");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "LineIn Left");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "LineIn Right");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "DMic 1");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "DMic 2");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "DMic 3");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "DMic 4");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "DMic 5");
-	ret |= snd_soc_dapm_disable_pin(&codec->dapm, "DMic 6");
+	ret = snd_soc_dapm_disable_pin(dapm, "Earpiece");
+	ret |= snd_soc_dapm_disable_pin(dapm, "Speaker Left");
+	ret |= snd_soc_dapm_disable_pin(dapm, "Speaker Right");
+	ret |= snd_soc_dapm_disable_pin(dapm, "LineOut Left");
+	ret |= snd_soc_dapm_disable_pin(dapm, "LineOut Right");
+	ret |= snd_soc_dapm_disable_pin(dapm, "Vibra 1");
+	ret |= snd_soc_dapm_disable_pin(dapm, "Vibra 2");
+	ret |= snd_soc_dapm_disable_pin(dapm, "Mic 1");
+	ret |= snd_soc_dapm_disable_pin(dapm, "Mic 2");
+	ret |= snd_soc_dapm_disable_pin(dapm, "LineIn Left");
+	ret |= snd_soc_dapm_disable_pin(dapm, "LineIn Right");
+	ret |= snd_soc_dapm_disable_pin(dapm, "DMic 1");
+	ret |= snd_soc_dapm_disable_pin(dapm, "DMic 2");
+	ret |= snd_soc_dapm_disable_pin(dapm, "DMic 3");
+	ret |= snd_soc_dapm_disable_pin(dapm, "DMic 4");
+	ret |= snd_soc_dapm_disable_pin(dapm, "DMic 5");
+	ret |= snd_soc_dapm_disable_pin(dapm, "DMic 6");
 
 	return ret;
 }
@@ -418,12 +431,9 @@ void mop500_ab8500_remove(struct snd_soc_card *card)
 {
 	struct mop500_ab8500_drvdata *drvdata = snd_soc_card_get_drvdata(card);
 
-	if (drvdata->clk_ptr_sysclk != NULL)
-		clk_put(drvdata->clk_ptr_sysclk);
-	if (drvdata->clk_ptr_ulpclk != NULL)
-		clk_put(drvdata->clk_ptr_ulpclk);
-	if (drvdata->clk_ptr_intclk != NULL)
-		clk_put(drvdata->clk_ptr_intclk);
+	clk_put(drvdata->clk_ptr_sysclk);
+	clk_put(drvdata->clk_ptr_ulpclk);
+	clk_put(drvdata->clk_ptr_intclk);
 
 	snd_soc_card_set_drvdata(card, drvdata);
 }

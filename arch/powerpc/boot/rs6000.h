@@ -1,10 +1,7 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* IBM RS/6000 "XCOFF" file definitions for BFD.
    Copyright (C) 1990, 1991 Free Software Foundation, Inc.
-   FIXME: Can someone provide a transliteration of this name into ASCII?
-   Using the following chars caused a compiler warning on HIUX (so I replaced
-   them with octal escapes), and isn't useful without an understanding of what
-   character set it is.
-   Written by Mimi Ph\373\364ng-Th\345o V\365 of IBM
+   Written by Mimi Phuong-Thao Vo of IBM
    and John Gilmore of Cygnus Support.  */
 
 /********************** FILE HEADER **********************/
@@ -239,5 +236,5 @@ struct external_reloc {
 #define DEFAULT_DATA_SECTION_ALIGNMENT 4
 #define DEFAULT_BSS_SECTION_ALIGNMENT 4
 #define DEFAULT_TEXT_SECTION_ALIGNMENT 4
-/* For new sections we havn't heard of before */
+/* For new sections we haven't heard of before */
 #define DEFAULT_SECTION_ALIGNMENT 4

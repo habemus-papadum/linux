@@ -19,7 +19,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <scsi/scsi_host.h>
@@ -96,7 +95,7 @@ static int generic_set_mode(struct ata_link *link, struct ata_device **unused)
 	return 0;
 }
 
-static struct scsi_host_template generic_sht = {
+static const struct scsi_host_template generic_sht = {
 	ATA_BMDMA_SHT(DRV_NAME),
 };
 
@@ -152,7 +151,7 @@ static int is_intel_ider(struct pci_dev *dev)
 }
 
 /**
- *	ata_generic_init		-	attach generic IDE
+ *	ata_generic_init_one		-	attach generic IDE
  *	@dev: PCI device found
  *	@id: match entry
  *
@@ -210,7 +209,7 @@ static int ata_generic_init_one(struct pci_dev *dev, const struct pci_device_id 
 	return ata_pci_bmdma_init_one(dev, ppi, &generic_sht, (void *)id, 0);
 }
 
-static struct pci_device_id ata_generic[] = {
+static const struct pci_device_id ata_generic[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_PCTECH, PCI_DEVICE_ID_PCTECH_SAMURAI_IDE), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_HOLTEK, PCI_DEVICE_ID_HOLTEK_6565), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_UMC,    PCI_DEVICE_ID_UMC_UM8673F), },
@@ -220,13 +219,6 @@ static struct pci_device_id ata_generic[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_VIA,    PCI_DEVICE_ID_VIA_82C561), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_OPTI,   PCI_DEVICE_ID_OPTI_82C558), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_CENATEK,PCI_DEVICE_ID_CENATEK_IDE),
-	  .driver_data = ATA_GEN_FORCE_DMA },
-	/*
-	 * For some reason, MCP89 on MacBook 7,1 doesn't work with
-	 * ahci, use ata_generic instead.
-	 */
-	{ PCI_VENDOR_ID_NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP89_SATA,
-	  PCI_VENDOR_ID_APPLE, 0xcb89,
 	  .driver_data = ATA_GEN_FORCE_DMA },
 #if !defined(CONFIG_PATA_TOSHIBA) && !defined(CONFIG_PATA_TOSHIBA_MODULE)
 	{ PCI_DEVICE(PCI_VENDOR_ID_TOSHIBA,PCI_DEVICE_ID_TOSHIBA_PICCOLO_1), },
@@ -249,7 +241,7 @@ static struct pci_driver ata_generic_pci_driver = {
 	.id_table	= ata_generic,
 	.probe 		= ata_generic_init_one,
 	.remove		= ata_pci_remove_one,
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 	.suspend	= ata_pci_device_suspend,
 	.resume		= ata_pci_device_resume,
 #endif

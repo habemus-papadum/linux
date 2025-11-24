@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  linux/mm/swap.c
  *
@@ -7,7 +8,7 @@
 /*
  * This file contains the default values for the operation of the
  * Linux VM subsystem. Fine-tuning documentation can be found in
- * Documentation/sysctl/vm.txt.
+ * Documentation/admin-guide/sysctl/vm.rst.
  * Started 18.12.91
  * Swap aging added 23.2.95, Stephen Tweedie.
  * Buffermem limits added 12.3.98, Rik van Riel.
@@ -24,6 +25,7 @@
 #include <linux/export.h>
 #include <linux/mm_inline.h>
 #include <linux/percpu_counter.h>
+#include <linux/memremap.h>
 #include <linux/percpu.h>
 #include <linux/cpu.h>
 #include <linux/notifier.h>
@@ -31,845 +33,1075 @@
 #include <linux/memcontrol.h>
 #include <linux/gfp.h>
 #include <linux/uio.h>
+#include <linux/hugetlb.h>
+#include <linux/page_idle.h>
+#include <linux/local_lock.h>
+#include <linux/buffer_head.h>
 
 #include "internal.h"
 
-/* How many pages do we try to swap or page in/out together? */
+#define CREATE_TRACE_POINTS
+#include <trace/events/pagemap.h>
+
+/* How many pages do we try to swap or page in/out together? As a power of 2 */
 int page_cluster;
+static const int page_cluster_max = 31;
 
-static DEFINE_PER_CPU(struct pagevec[NR_LRU_LISTS], lru_add_pvecs);
-static DEFINE_PER_CPU(struct pagevec, lru_rotate_pvecs);
-static DEFINE_PER_CPU(struct pagevec, lru_deactivate_pvecs);
-
-/*
- * This path almost never happens for VM activity - pages are normally
- * freed via pagevecs.  But it gets used by networking.
- */
-static void __page_cache_release(struct page *page)
-{
-	if (PageLRU(page)) {
-		struct zone *zone = page_zone(page);
-		struct lruvec *lruvec;
-		unsigned long flags;
-
-		spin_lock_irqsave(&zone->lru_lock, flags);
-		lruvec = mem_cgroup_page_lruvec(page, zone);
-		VM_BUG_ON(!PageLRU(page));
-		__ClearPageLRU(page);
-		del_page_from_lru_list(page, lruvec, page_off_lru(page));
-		spin_unlock_irqrestore(&zone->lru_lock, flags);
-	}
-}
-
-static void __put_single_page(struct page *page)
-{
-	__page_cache_release(page);
-	free_hot_cold_page(page, 0);
-}
-
-static void __put_compound_page(struct page *page)
-{
-	compound_page_dtor *dtor;
-
-	__page_cache_release(page);
-	dtor = get_compound_page_dtor(page);
-	(*dtor)(page);
-}
-
-static void put_compound_page(struct page *page)
-{
-	if (unlikely(PageTail(page))) {
-		/* __split_huge_page_refcount can run under us */
-		struct page *page_head = compound_trans_head(page);
-
-		if (likely(page != page_head &&
-			   get_page_unless_zero(page_head))) {
-			unsigned long flags;
-
-			/*
-			 * THP can not break up slab pages so avoid taking
-			 * compound_lock().  Slab performs non-atomic bit ops
-			 * on page->flags for better performance.  In particular
-			 * slab_unlock() in slub used to be a hot path.  It is
-			 * still hot on arches that do not support
-			 * this_cpu_cmpxchg_double().
-			 */
-			if (PageSlab(page_head)) {
-				if (PageTail(page)) {
-					if (put_page_testzero(page_head))
-						VM_BUG_ON(1);
-
-					atomic_dec(&page->_mapcount);
-					goto skip_lock_tail;
-				} else
-					goto skip_lock;
-			}
-			/*
-			 * page_head wasn't a dangling pointer but it
-			 * may not be a head page anymore by the time
-			 * we obtain the lock. That is ok as long as it
-			 * can't be freed from under us.
-			 */
-			flags = compound_lock_irqsave(page_head);
-			if (unlikely(!PageTail(page))) {
-				/* __split_huge_page_refcount run before us */
-				compound_unlock_irqrestore(page_head, flags);
-skip_lock:
-				if (put_page_testzero(page_head))
-					__put_single_page(page_head);
-out_put_single:
-				if (put_page_testzero(page))
-					__put_single_page(page);
-				return;
-			}
-			VM_BUG_ON(page_head != page->first_page);
-			/*
-			 * We can release the refcount taken by
-			 * get_page_unless_zero() now that
-			 * __split_huge_page_refcount() is blocked on
-			 * the compound_lock.
-			 */
-			if (put_page_testzero(page_head))
-				VM_BUG_ON(1);
-			/* __split_huge_page_refcount will wait now */
-			VM_BUG_ON(page_mapcount(page) <= 0);
-			atomic_dec(&page->_mapcount);
-			VM_BUG_ON(atomic_read(&page_head->_count) <= 0);
-			VM_BUG_ON(atomic_read(&page->_count) != 0);
-			compound_unlock_irqrestore(page_head, flags);
-
-skip_lock_tail:
-			if (put_page_testzero(page_head)) {
-				if (PageHead(page_head))
-					__put_compound_page(page_head);
-				else
-					__put_single_page(page_head);
-			}
-		} else {
-			/* page_head is a dangling pointer */
-			VM_BUG_ON(PageTail(page));
-			goto out_put_single;
-		}
-	} else if (put_page_testzero(page)) {
-		if (PageHead(page))
-			__put_compound_page(page);
-		else
-			__put_single_page(page);
-	}
-}
-
-void put_page(struct page *page)
-{
-	if (unlikely(PageCompound(page)))
-		put_compound_page(page);
-	else if (put_page_testzero(page))
-		__put_single_page(page);
-}
-EXPORT_SYMBOL(put_page);
-
-/*
- * This function is exported but must not be called by anything other
- * than get_page(). It implements the slow path of get_page().
- */
-bool __get_page_tail(struct page *page)
-{
+struct cpu_fbatches {
 	/*
-	 * This takes care of get_page() if run on a tail page
-	 * returned by one of the get_user_pages/follow_page variants.
-	 * get_user_pages/follow_page itself doesn't need the compound
-	 * lock because it runs __get_page_tail_foll() under the
-	 * proper PT lock that already serializes against
-	 * split_huge_page().
+	 * The following folio batches are grouped together because they are protected
+	 * by disabling preemption (and interrupts remain enabled).
 	 */
+	local_lock_t lock;
+	struct folio_batch lru_add;
+	struct folio_batch lru_deactivate_file;
+	struct folio_batch lru_deactivate;
+	struct folio_batch lru_lazyfree;
+#ifdef CONFIG_SMP
+	struct folio_batch lru_activate;
+#endif
+	/* Protecting the following batches which require disabling interrupts */
+	local_lock_t lock_irq;
+	struct folio_batch lru_move_tail;
+};
+
+static DEFINE_PER_CPU(struct cpu_fbatches, cpu_fbatches) = {
+	.lock = INIT_LOCAL_LOCK(lock),
+	.lock_irq = INIT_LOCAL_LOCK(lock_irq),
+};
+
+static void __page_cache_release(struct folio *folio, struct lruvec **lruvecp,
+		unsigned long *flagsp)
+{
+	if (folio_test_lru(folio)) {
+		folio_lruvec_relock_irqsave(folio, lruvecp, flagsp);
+		lruvec_del_folio(*lruvecp, folio);
+		__folio_clear_lru_flags(folio);
+	}
+}
+
+/*
+ * This path almost never happens for VM activity - pages are normally freed
+ * in batches.  But it gets used by networking - and for compound pages.
+ */
+static void page_cache_release(struct folio *folio)
+{
+	struct lruvec *lruvec = NULL;
 	unsigned long flags;
-	bool got = false;
-	struct page *page_head = compound_trans_head(page);
 
-	if (likely(page != page_head && get_page_unless_zero(page_head))) {
+	__page_cache_release(folio, &lruvec, &flags);
+	if (lruvec)
+		unlock_page_lruvec_irqrestore(lruvec, flags);
+}
 
-		/* Ref to put_compound_page() comment. */
-		if (PageSlab(page_head)) {
-			if (likely(PageTail(page))) {
-				__get_page_tail_foll(page, false);
-				return true;
-			} else {
-				put_page(page_head);
-				return false;
-			}
-		}
+void __folio_put(struct folio *folio)
+{
+	if (unlikely(folio_is_zone_device(folio))) {
+		free_zone_device_folio(folio);
+		return;
+	}
 
+	if (folio_test_hugetlb(folio)) {
+		free_huge_folio(folio);
+		return;
+	}
+
+	page_cache_release(folio);
+	folio_unqueue_deferred_split(folio);
+	mem_cgroup_uncharge(folio);
+	free_frozen_pages(&folio->page, folio_order(folio));
+}
+EXPORT_SYMBOL(__folio_put);
+
+typedef void (*move_fn_t)(struct lruvec *lruvec, struct folio *folio);
+
+static void lru_add(struct lruvec *lruvec, struct folio *folio)
+{
+	int was_unevictable = folio_test_clear_unevictable(folio);
+	long nr_pages = folio_nr_pages(folio);
+
+	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+
+	/*
+	 * Is an smp_mb__after_atomic() still required here, before
+	 * folio_evictable() tests the mlocked flag, to rule out the possibility
+	 * of stranding an evictable folio on an unevictable LRU?  I think
+	 * not, because __munlock_folio() only clears the mlocked flag
+	 * while the LRU lock is held.
+	 *
+	 * (That is not true of __page_cache_release(), and not necessarily
+	 * true of folios_put(): but those only clear the mlocked flag after
+	 * folio_put_testzero() has excluded any other users of the folio.)
+	 */
+	if (folio_evictable(folio)) {
+		if (was_unevictable)
+			__count_vm_events(UNEVICTABLE_PGRESCUED, nr_pages);
+	} else {
+		folio_clear_active(folio);
+		folio_set_unevictable(folio);
 		/*
-		 * page_head wasn't a dangling pointer but it
-		 * may not be a head page anymore by the time
-		 * we obtain the lock. That is ok as long as it
-		 * can't be freed from under us.
+		 * folio->mlock_count = !!folio_test_mlocked(folio)?
+		 * But that leaves __mlock_folio() in doubt whether another
+		 * actor has already counted the mlock or not.  Err on the
+		 * safe side, underestimate, let page reclaim fix it, rather
+		 * than leaving a page on the unevictable LRU indefinitely.
 		 */
-		flags = compound_lock_irqsave(page_head);
-		/* here __split_huge_page_refcount won't run anymore */
-		if (likely(PageTail(page))) {
-			__get_page_tail_foll(page, false);
-			got = true;
-		}
-		compound_unlock_irqrestore(page_head, flags);
-		if (unlikely(!got))
-			put_page(page_head);
-	}
-	return got;
-}
-EXPORT_SYMBOL(__get_page_tail);
-
-/**
- * put_pages_list() - release a list of pages
- * @pages: list of pages threaded on page->lru
- *
- * Release a list of pages which are strung together on page.lru.  Currently
- * used by read_cache_pages() and related error recovery code.
- */
-void put_pages_list(struct list_head *pages)
-{
-	while (!list_empty(pages)) {
-		struct page *victim;
-
-		victim = list_entry(pages->prev, struct page, lru);
-		list_del(&victim->lru);
-		page_cache_release(victim);
-	}
-}
-EXPORT_SYMBOL(put_pages_list);
-
-/*
- * get_kernel_pages() - pin kernel pages in memory
- * @kiov:	An array of struct kvec structures
- * @nr_segs:	number of segments to pin
- * @write:	pinning for read/write, currently ignored
- * @pages:	array that receives pointers to the pages pinned.
- *		Should be at least nr_segs long.
- *
- * Returns number of pages pinned. This may be fewer than the number
- * requested. If nr_pages is 0 or negative, returns 0. If no pages
- * were pinned, returns -errno. Each page returned must be released
- * with a put_page() call when it is finished with.
- */
-int get_kernel_pages(const struct kvec *kiov, int nr_segs, int write,
-		struct page **pages)
-{
-	int seg;
-
-	for (seg = 0; seg < nr_segs; seg++) {
-		if (WARN_ON(kiov[seg].iov_len != PAGE_SIZE))
-			return seg;
-
-		pages[seg] = kmap_to_page(kiov[seg].iov_base);
-		page_cache_get(pages[seg]);
+		folio->mlock_count = 0;
+		if (!was_unevictable)
+			__count_vm_events(UNEVICTABLE_PGCULLED, nr_pages);
 	}
 
-	return seg;
+	lruvec_add_folio(lruvec, folio);
+	trace_mm_lru_insertion(folio);
 }
-EXPORT_SYMBOL_GPL(get_kernel_pages);
 
-/*
- * get_kernel_page() - pin a kernel page in memory
- * @start:	starting kernel address
- * @write:	pinning for read/write, currently ignored
- * @pages:	array that receives pointer to the page pinned.
- *		Must be at least nr_segs long.
- *
- * Returns 1 if page is pinned. If the page was not pinned, returns
- * -errno. The page returned must be released with a put_page() call
- * when it is finished with.
- */
-int get_kernel_page(unsigned long start, int write, struct page **pages)
-{
-	const struct kvec kiov = {
-		.iov_base = (void *)start,
-		.iov_len = PAGE_SIZE
-	};
-
-	return get_kernel_pages(&kiov, 1, write, pages);
-}
-EXPORT_SYMBOL_GPL(get_kernel_page);
-
-static void pagevec_lru_move_fn(struct pagevec *pvec,
-	void (*move_fn)(struct page *page, struct lruvec *lruvec, void *arg),
-	void *arg)
+static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 {
 	int i;
-	struct zone *zone = NULL;
-	struct lruvec *lruvec;
+	struct lruvec *lruvec = NULL;
 	unsigned long flags = 0;
 
-	for (i = 0; i < pagevec_count(pvec); i++) {
-		struct page *page = pvec->pages[i];
-		struct zone *pagezone = page_zone(page);
+	for (i = 0; i < folio_batch_count(fbatch); i++) {
+		struct folio *folio = fbatch->folios[i];
 
-		if (pagezone != zone) {
-			if (zone)
-				spin_unlock_irqrestore(&zone->lru_lock, flags);
-			zone = pagezone;
-			spin_lock_irqsave(&zone->lru_lock, flags);
+		/* block memcg migration while the folio moves between lru */
+		if (move_fn != lru_add && !folio_test_clear_lru(folio))
+			continue;
+
+		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
+		move_fn(lruvec, folio);
+
+		folio_set_lru(folio);
+	}
+
+	if (lruvec)
+		unlock_page_lruvec_irqrestore(lruvec, flags);
+	folios_put(fbatch);
+}
+
+static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
+		struct folio *folio, move_fn_t move_fn, bool disable_irq)
+{
+	unsigned long flags;
+
+	folio_get(folio);
+
+	if (disable_irq)
+		local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
+	else
+		local_lock(&cpu_fbatches.lock);
+
+	if (!folio_batch_add(this_cpu_ptr(fbatch), folio) ||
+			!folio_may_be_lru_cached(folio) || lru_cache_disabled())
+		folio_batch_move_lru(this_cpu_ptr(fbatch), move_fn);
+
+	if (disable_irq)
+		local_unlock_irqrestore(&cpu_fbatches.lock_irq, flags);
+	else
+		local_unlock(&cpu_fbatches.lock);
+}
+
+#define folio_batch_add_and_move(folio, op)		\
+	__folio_batch_add_and_move(			\
+		&cpu_fbatches.op,			\
+		folio,					\
+		op,					\
+		offsetof(struct cpu_fbatches, op) >=	\
+		offsetof(struct cpu_fbatches, lock_irq)	\
+	)
+
+static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
+{
+	if (folio_test_unevictable(folio))
+		return;
+
+	lruvec_del_folio(lruvec, folio);
+	folio_clear_active(folio);
+	lruvec_add_folio_tail(lruvec, folio);
+	__count_vm_events(PGROTATED, folio_nr_pages(folio));
+}
+
+/*
+ * Writeback is about to end against a folio which has been marked for
+ * immediate reclaim.  If it still appears to be reclaimable, move it
+ * to the tail of the inactive list.
+ *
+ * folio_rotate_reclaimable() must disable IRQs, to prevent nasty races.
+ */
+void folio_rotate_reclaimable(struct folio *folio)
+{
+	if (folio_test_locked(folio) || folio_test_dirty(folio) ||
+	    folio_test_unevictable(folio) || !folio_test_lru(folio))
+		return;
+
+	folio_batch_add_and_move(folio, lru_move_tail);
+}
+
+void lru_note_cost_unlock_irq(struct lruvec *lruvec, bool file,
+		unsigned int nr_io, unsigned int nr_rotated)
+		__releases(lruvec->lru_lock)
+{
+	unsigned long cost;
+
+	/*
+	 * Reflect the relative cost of incurring IO and spending CPU
+	 * time on rotations. This doesn't attempt to make a precise
+	 * comparison, it just says: if reloads are about comparable
+	 * between the LRU lists, or rotations are overwhelmingly
+	 * different between them, adjust scan balance for CPU work.
+	 */
+	cost = nr_io * SWAP_CLUSTER_MAX + nr_rotated;
+	if (!cost) {
+		spin_unlock_irq(&lruvec->lru_lock);
+		return;
+	}
+
+	for (;;) {
+		unsigned long lrusize;
+
+		/* Record cost event */
+		if (file)
+			lruvec->file_cost += cost;
+		else
+			lruvec->anon_cost += cost;
+
+		/*
+		 * Decay previous events
+		 *
+		 * Because workloads change over time (and to avoid
+		 * overflow) we keep these statistics as a floating
+		 * average, which ends up weighing recent refaults
+		 * more than old ones.
+		 */
+		lrusize = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
+			  lruvec_page_state(lruvec, NR_ACTIVE_ANON) +
+			  lruvec_page_state(lruvec, NR_INACTIVE_FILE) +
+			  lruvec_page_state(lruvec, NR_ACTIVE_FILE);
+
+		if (lruvec->file_cost + lruvec->anon_cost > lrusize / 4) {
+			lruvec->file_cost /= 2;
+			lruvec->anon_cost /= 2;
 		}
 
-		lruvec = mem_cgroup_page_lruvec(page, zone);
-		(*move_fn)(page, lruvec, arg);
-	}
-	if (zone)
-		spin_unlock_irqrestore(&zone->lru_lock, flags);
-	release_pages(pvec->pages, pvec->nr, pvec->cold);
-	pagevec_reinit(pvec);
-}
-
-static void pagevec_move_tail_fn(struct page *page, struct lruvec *lruvec,
-				 void *arg)
-{
-	int *pgmoved = arg;
-
-	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
-		enum lru_list lru = page_lru_base_type(page);
-		list_move_tail(&page->lru, &lruvec->lists[lru]);
-		(*pgmoved)++;
+		spin_unlock_irq(&lruvec->lru_lock);
+		lruvec = parent_lruvec(lruvec);
+		if (!lruvec)
+			break;
+		spin_lock_irq(&lruvec->lru_lock);
 	}
 }
 
-/*
- * pagevec_move_tail() must be called with IRQ disabled.
- * Otherwise this may cause nasty races.
- */
-static void pagevec_move_tail(struct pagevec *pvec)
+void lru_note_cost_refault(struct folio *folio)
 {
-	int pgmoved = 0;
+	struct lruvec *lruvec;
 
-	pagevec_lru_move_fn(pvec, pagevec_move_tail_fn, &pgmoved);
-	__count_vm_events(PGROTATED, pgmoved);
+	lruvec = folio_lruvec_lock_irq(folio);
+	lru_note_cost_unlock_irq(lruvec, folio_is_file_lru(folio),
+				folio_nr_pages(folio), 0);
 }
 
-/*
- * Writeback is about to end against a page which has been marked for immediate
- * reclaim.  If it still appears to be reclaimable, move it to the tail of the
- * inactive list.
- */
-void rotate_reclaimable_page(struct page *page)
+static void lru_activate(struct lruvec *lruvec, struct folio *folio)
 {
-	if (!PageLocked(page) && !PageDirty(page) && !PageActive(page) &&
-	    !PageUnevictable(page) && PageLRU(page)) {
-		struct pagevec *pvec;
-		unsigned long flags;
+	long nr_pages = folio_nr_pages(folio);
 
-		page_cache_get(page);
-		local_irq_save(flags);
-		pvec = &__get_cpu_var(lru_rotate_pvecs);
-		if (!pagevec_add(pvec, page))
-			pagevec_move_tail(pvec);
-		local_irq_restore(flags);
-	}
-}
+	if (folio_test_active(folio) || folio_test_unevictable(folio))
+		return;
 
-static void update_page_reclaim_stat(struct lruvec *lruvec,
-				     int file, int rotated)
-{
-	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
 
-	reclaim_stat->recent_scanned[file]++;
-	if (rotated)
-		reclaim_stat->recent_rotated[file]++;
-}
+	lruvec_del_folio(lruvec, folio);
+	folio_set_active(folio);
+	lruvec_add_folio(lruvec, folio);
+	trace_mm_lru_activate(folio);
 
-static void __activate_page(struct page *page, struct lruvec *lruvec,
-			    void *arg)
-{
-	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
-		int file = page_is_file_cache(page);
-		int lru = page_lru_base_type(page);
-
-		del_page_from_lru_list(page, lruvec, lru);
-		SetPageActive(page);
-		lru += LRU_ACTIVE;
-		add_page_to_lru_list(page, lruvec, lru);
-
-		__count_vm_event(PGACTIVATE);
-		update_page_reclaim_stat(lruvec, file, 1);
-	}
+	__count_vm_events(PGACTIVATE, nr_pages);
+	count_memcg_events(lruvec_memcg(lruvec), PGACTIVATE, nr_pages);
 }
 
 #ifdef CONFIG_SMP
-static DEFINE_PER_CPU(struct pagevec, activate_page_pvecs);
-
-static void activate_page_drain(int cpu)
+static void folio_activate_drain(int cpu)
 {
-	struct pagevec *pvec = &per_cpu(activate_page_pvecs, cpu);
+	struct folio_batch *fbatch = &per_cpu(cpu_fbatches.lru_activate, cpu);
 
-	if (pagevec_count(pvec))
-		pagevec_lru_move_fn(pvec, __activate_page, NULL);
+	if (folio_batch_count(fbatch))
+		folio_batch_move_lru(fbatch, lru_activate);
 }
 
-void activate_page(struct page *page)
+void folio_activate(struct folio *folio)
 {
-	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
-		struct pagevec *pvec = &get_cpu_var(activate_page_pvecs);
+	if (folio_test_active(folio) || folio_test_unevictable(folio) ||
+	    !folio_test_lru(folio))
+		return;
 
-		page_cache_get(page);
-		if (!pagevec_add(pvec, page))
-			pagevec_lru_move_fn(pvec, __activate_page, NULL);
-		put_cpu_var(activate_page_pvecs);
-	}
+	folio_batch_add_and_move(folio, lru_activate);
 }
 
 #else
-static inline void activate_page_drain(int cpu)
+static inline void folio_activate_drain(int cpu)
 {
 }
 
-void activate_page(struct page *page)
+void folio_activate(struct folio *folio)
 {
-	struct zone *zone = page_zone(page);
+	struct lruvec *lruvec;
 
-	spin_lock_irq(&zone->lru_lock);
-	__activate_page(page, mem_cgroup_page_lruvec(page, zone), NULL);
-	spin_unlock_irq(&zone->lru_lock);
+	if (!folio_test_clear_lru(folio))
+		return;
+
+	lruvec = folio_lruvec_lock_irq(folio);
+	lru_activate(lruvec, folio);
+	unlock_page_lruvec_irq(lruvec);
+	folio_set_lru(folio);
 }
 #endif
 
-/*
- * Mark a page as having seen activity.
- *
- * inactive,unreferenced	->	inactive,referenced
- * inactive,referenced		->	active,unreferenced
- * active,unreferenced		->	active,referenced
- */
-void mark_page_accessed(struct page *page)
+static void __lru_cache_activate_folio(struct folio *folio)
 {
-	if (!PageActive(page) && !PageUnevictable(page) &&
-			PageReferenced(page) && PageLRU(page)) {
-		activate_page(page);
-		ClearPageReferenced(page);
-	} else if (!PageReferenced(page)) {
-		SetPageReferenced(page);
-	}
-}
-EXPORT_SYMBOL(mark_page_accessed);
+	struct folio_batch *fbatch;
+	int i;
 
-/*
- * Order of operations is important: flush the pagevec when it's already
- * full, not when adding the last page, to make sure that last page is
- * not added to the LRU directly when passed to this function. Because
- * mark_page_accessed() (called after this when writing) only activates
- * pages that are on the LRU, linear writes in subpage chunks would see
- * every PAGEVEC_SIZE page activated, which is unexpected.
- */
-void __lru_cache_add(struct page *page, enum lru_list lru)
-{
-	struct pagevec *pvec = &get_cpu_var(lru_add_pvecs)[lru];
+	local_lock(&cpu_fbatches.lock);
+	fbatch = this_cpu_ptr(&cpu_fbatches.lru_add);
 
-	page_cache_get(page);
-	if (!pagevec_space(pvec))
-		__pagevec_lru_add(pvec, lru);
-	pagevec_add(pvec, page);
-	put_cpu_var(lru_add_pvecs);
-}
-EXPORT_SYMBOL(__lru_cache_add);
+	/*
+	 * Search backwards on the optimistic assumption that the folio being
+	 * activated has just been added to this batch. Note that only
+	 * the local batch is examined as a !LRU folio could be in the
+	 * process of being released, reclaimed, migrated or on a remote
+	 * batch that is currently being drained. Furthermore, marking
+	 * a remote batch's folio active potentially hits a race where
+	 * a folio is marked active just after it is added to the inactive
+	 * list causing accounting errors and BUG_ON checks to trigger.
+	 */
+	for (i = folio_batch_count(fbatch) - 1; i >= 0; i--) {
+		struct folio *batch_folio = fbatch->folios[i];
 
-/**
- * lru_cache_add_lru - add a page to a page list
- * @page: the page to be added to the LRU.
- * @lru: the LRU list to which the page is added.
- */
-void lru_cache_add_lru(struct page *page, enum lru_list lru)
-{
-	if (PageActive(page)) {
-		VM_BUG_ON(PageUnevictable(page));
-		ClearPageActive(page);
-	} else if (PageUnevictable(page)) {
-		VM_BUG_ON(PageActive(page));
-		ClearPageUnevictable(page);
+		if (batch_folio == folio) {
+			folio_set_active(folio);
+			break;
+		}
 	}
 
-	VM_BUG_ON(PageLRU(page) || PageActive(page) || PageUnevictable(page));
-	__lru_cache_add(page, lru);
+	local_unlock(&cpu_fbatches.lock);
 }
 
-/**
- * add_page_to_unevictable_list - add a page to the unevictable list
- * @page:  the page to be added to the unevictable list
- *
- * Add page directly to its zone's unevictable list.  To avoid races with
- * tasks that might be making the page evictable, through eg. munlock,
- * munmap or exit, while it's not on the lru, we want to add the page
- * while it's locked or otherwise "invisible" to other tasks.  This is
- * difficult to do when using the pagevec cache, so bypass that.
- */
-void add_page_to_unevictable_list(struct page *page)
-{
-	struct zone *zone = page_zone(page);
-	struct lruvec *lruvec;
+#ifdef CONFIG_LRU_GEN
 
-	spin_lock_irq(&zone->lru_lock);
-	lruvec = mem_cgroup_page_lruvec(page, zone);
-	SetPageUnevictable(page);
-	SetPageLRU(page);
-	add_page_to_lru_list(page, lruvec, LRU_UNEVICTABLE);
-	spin_unlock_irq(&zone->lru_lock);
+static void lru_gen_inc_refs(struct folio *folio)
+{
+	unsigned long new_flags, old_flags = READ_ONCE(folio->flags.f);
+
+	if (folio_test_unevictable(folio))
+		return;
+
+	/* see the comment on LRU_REFS_FLAGS */
+	if (!folio_test_referenced(folio)) {
+		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, BIT(PG_referenced));
+		return;
+	}
+
+	do {
+		if ((old_flags & LRU_REFS_MASK) == LRU_REFS_MASK) {
+			if (!folio_test_workingset(folio))
+				folio_set_workingset(folio);
+			return;
+		}
+
+		new_flags = old_flags + BIT(LRU_REFS_PGOFF);
+	} while (!try_cmpxchg(&folio->flags.f, &old_flags, new_flags));
+}
+
+static bool lru_gen_clear_refs(struct folio *folio)
+{
+	struct lru_gen_folio *lrugen;
+	int gen = folio_lru_gen(folio);
+	int type = folio_is_file_lru(folio);
+
+	if (gen < 0)
+		return true;
+
+	set_mask_bits(&folio->flags.f, LRU_REFS_FLAGS | BIT(PG_workingset), 0);
+
+	lrugen = &folio_lruvec(folio)->lrugen;
+	/* whether can do without shuffling under the LRU lock */
+	return gen == lru_gen_from_seq(READ_ONCE(lrugen->min_seq[type]));
+}
+
+#else /* !CONFIG_LRU_GEN */
+
+static void lru_gen_inc_refs(struct folio *folio)
+{
+}
+
+static bool lru_gen_clear_refs(struct folio *folio)
+{
+	return false;
+}
+
+#endif /* CONFIG_LRU_GEN */
+
+/**
+ * folio_mark_accessed - Mark a folio as having seen activity.
+ * @folio: The folio to mark.
+ *
+ * This function will perform one of the following transitions:
+ *
+ * * inactive,unreferenced	->	inactive,referenced
+ * * inactive,referenced	->	active,unreferenced
+ * * active,unreferenced	->	active,referenced
+ *
+ * When a newly allocated folio is not yet visible, so safe for non-atomic ops,
+ * __folio_set_referenced() may be substituted for folio_mark_accessed().
+ */
+void folio_mark_accessed(struct folio *folio)
+{
+	if (folio_test_dropbehind(folio))
+		return;
+	if (lru_gen_enabled()) {
+		lru_gen_inc_refs(folio);
+		return;
+	}
+
+	if (!folio_test_referenced(folio)) {
+		folio_set_referenced(folio);
+	} else if (folio_test_unevictable(folio)) {
+		/*
+		 * Unevictable pages are on the "LRU_UNEVICTABLE" list. But,
+		 * this list is never rotated or maintained, so marking an
+		 * unevictable page accessed has no effect.
+		 */
+	} else if (!folio_test_active(folio)) {
+		/*
+		 * If the folio is on the LRU, queue it for activation via
+		 * cpu_fbatches.lru_activate. Otherwise, assume the folio is in a
+		 * folio_batch, mark it active and it'll be moved to the active
+		 * LRU on the next drain.
+		 */
+		if (folio_test_lru(folio))
+			folio_activate(folio);
+		else
+			__lru_cache_activate_folio(folio);
+		folio_clear_referenced(folio);
+		workingset_activation(folio);
+	}
+	if (folio_test_idle(folio))
+		folio_clear_idle(folio);
+}
+EXPORT_SYMBOL(folio_mark_accessed);
+
+/**
+ * folio_add_lru - Add a folio to an LRU list.
+ * @folio: The folio to be added to the LRU.
+ *
+ * Queue the folio for addition to the LRU. The decision on whether
+ * to add the page to the [in]active [file|anon] list is deferred until the
+ * folio_batch is drained. This gives a chance for the caller of folio_add_lru()
+ * have the folio added to the active list using folio_mark_accessed().
+ */
+void folio_add_lru(struct folio *folio)
+{
+	VM_BUG_ON_FOLIO(folio_test_active(folio) &&
+			folio_test_unevictable(folio), folio);
+	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+
+	/* see the comment in lru_gen_folio_seq() */
+	if (lru_gen_enabled() && !folio_test_unevictable(folio) &&
+	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
+		folio_set_active(folio);
+
+	folio_batch_add_and_move(folio, lru_add);
+}
+EXPORT_SYMBOL(folio_add_lru);
+
+/**
+ * folio_add_lru_vma() - Add a folio to the appropate LRU list for this VMA.
+ * @folio: The folio to be added to the LRU.
+ * @vma: VMA in which the folio is mapped.
+ *
+ * If the VMA is mlocked, @folio is added to the unevictable list.
+ * Otherwise, it is treated the same way as folio_add_lru().
+ */
+void folio_add_lru_vma(struct folio *folio, struct vm_area_struct *vma)
+{
+	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+
+	if (unlikely((vma->vm_flags & (VM_LOCKED | VM_SPECIAL)) == VM_LOCKED))
+		mlock_new_folio(folio);
+	else
+		folio_add_lru(folio);
 }
 
 /*
- * If the page can not be invalidated, it is moved to the
+ * If the folio cannot be invalidated, it is moved to the
  * inactive list to speed up its reclaim.  It is moved to the
  * head of the list, rather than the tail, to give the flusher
  * threads some time to write it out, as this is much more
  * effective than the single-page writeout from reclaim.
  *
- * If the page isn't page_mapped and dirty/writeback, the page
- * could reclaim asap using PG_reclaim.
+ * If the folio isn't mapped and dirty/writeback, the folio
+ * could be reclaimed asap using the reclaim flag.
  *
- * 1. active, mapped page -> none
- * 2. active, dirty/writeback page -> inactive, head, PG_reclaim
- * 3. inactive, mapped page -> none
- * 4. inactive, dirty/writeback page -> inactive, head, PG_reclaim
+ * 1. active, mapped folio -> none
+ * 2. active, dirty/writeback folio -> inactive, head, reclaim
+ * 3. inactive, mapped folio -> none
+ * 4. inactive, dirty/writeback folio -> inactive, head, reclaim
  * 5. inactive, clean -> inactive, tail
  * 6. Others -> none
  *
- * In 4, why it moves inactive's head, the VM expects the page would
- * be write it out by flusher threads as this is much more effective
+ * In 4, it moves to the head of the inactive list so the folio is
+ * written out by flusher threads as this is much more efficient
  * than the single-page writeout from reclaim.
  */
-static void lru_deactivate_fn(struct page *page, struct lruvec *lruvec,
-			      void *arg)
+static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
 {
-	int lru, file;
-	bool active;
+	bool active = folio_test_active(folio) || lru_gen_enabled();
+	long nr_pages = folio_nr_pages(folio);
 
-	if (!PageLRU(page))
+	if (folio_test_unevictable(folio))
 		return;
 
-	if (PageUnevictable(page))
+	/* Some processes are using the folio */
+	if (folio_mapped(folio))
 		return;
 
-	/* Some processes are using the page */
-	if (page_mapped(page))
-		return;
+	lruvec_del_folio(lruvec, folio);
+	folio_clear_active(folio);
+	folio_clear_referenced(folio);
 
-	active = PageActive(page);
-	file = page_is_file_cache(page);
-	lru = page_lru_base_type(page);
-
-	del_page_from_lru_list(page, lruvec, lru + active);
-	ClearPageActive(page);
-	ClearPageReferenced(page);
-	add_page_to_lru_list(page, lruvec, lru);
-
-	if (PageWriteback(page) || PageDirty(page)) {
+	if (folio_test_writeback(folio) || folio_test_dirty(folio)) {
 		/*
-		 * PG_reclaim could be raced with end_page_writeback
-		 * It can make readahead confusing.  But race window
-		 * is _really_ small and  it's non-critical problem.
+		 * Setting the reclaim flag could race with
+		 * folio_end_writeback() and confuse readahead.  But the
+		 * race window is _really_ small and  it's not a critical
+		 * problem.
 		 */
-		SetPageReclaim(page);
+		lruvec_add_folio(lruvec, folio);
+		folio_set_reclaim(folio);
 	} else {
 		/*
-		 * The page's writeback ends up during pagevec
-		 * We moves tha page into tail of inactive.
+		 * The folio's writeback ended while it was in the batch.
+		 * We move that folio to the tail of the inactive list.
 		 */
-		list_move_tail(&page->lru, &lruvec->lists[lru]);
-		__count_vm_event(PGROTATED);
+		lruvec_add_folio_tail(lruvec, folio);
+		__count_vm_events(PGROTATED, nr_pages);
 	}
 
-	if (active)
-		__count_vm_event(PGDEACTIVATE);
-	update_page_reclaim_stat(lruvec, file, 0);
+	if (active) {
+		__count_vm_events(PGDEACTIVATE, nr_pages);
+		count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE,
+				     nr_pages);
+	}
+}
+
+static void lru_deactivate(struct lruvec *lruvec, struct folio *folio)
+{
+	long nr_pages = folio_nr_pages(folio);
+
+	if (folio_test_unevictable(folio) || !(folio_test_active(folio) || lru_gen_enabled()))
+		return;
+
+	lruvec_del_folio(lruvec, folio);
+	folio_clear_active(folio);
+	folio_clear_referenced(folio);
+	lruvec_add_folio(lruvec, folio);
+
+	__count_vm_events(PGDEACTIVATE, nr_pages);
+	count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_pages);
+}
+
+static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
+{
+	long nr_pages = folio_nr_pages(folio);
+
+	if (!folio_test_anon(folio) || !folio_test_swapbacked(folio) ||
+	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
+		return;
+
+	lruvec_del_folio(lruvec, folio);
+	folio_clear_active(folio);
+	if (lru_gen_enabled())
+		lru_gen_clear_refs(folio);
+	else
+		folio_clear_referenced(folio);
+	/*
+	 * Lazyfree folios are clean anonymous folios.  They have
+	 * the swapbacked flag cleared, to distinguish them from normal
+	 * anonymous folios
+	 */
+	folio_clear_swapbacked(folio);
+	lruvec_add_folio(lruvec, folio);
+
+	__count_vm_events(PGLAZYFREE, nr_pages);
+	count_memcg_events(lruvec_memcg(lruvec), PGLAZYFREE, nr_pages);
 }
 
 /*
- * Drain pages out of the cpu's pagevecs.
+ * Drain pages out of the cpu's folio_batch.
  * Either "cpu" is the current CPU, and preemption has already been
  * disabled; or "cpu" is being hot-unplugged, and is already dead.
  */
 void lru_add_drain_cpu(int cpu)
 {
-	struct pagevec *pvecs = per_cpu(lru_add_pvecs, cpu);
-	struct pagevec *pvec;
-	int lru;
+	struct cpu_fbatches *fbatches = &per_cpu(cpu_fbatches, cpu);
+	struct folio_batch *fbatch = &fbatches->lru_add;
 
-	for_each_lru(lru) {
-		pvec = &pvecs[lru - LRU_BASE];
-		if (pagevec_count(pvec))
-			__pagevec_lru_add(pvec, lru);
-	}
+	if (folio_batch_count(fbatch))
+		folio_batch_move_lru(fbatch, lru_add);
 
-	pvec = &per_cpu(lru_rotate_pvecs, cpu);
-	if (pagevec_count(pvec)) {
+	fbatch = &fbatches->lru_move_tail;
+	/* Disabling interrupts below acts as a compiler barrier. */
+	if (data_race(folio_batch_count(fbatch))) {
 		unsigned long flags;
 
 		/* No harm done if a racing interrupt already did this */
-		local_irq_save(flags);
-		pagevec_move_tail(pvec);
-		local_irq_restore(flags);
+		local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
+		folio_batch_move_lru(fbatch, lru_move_tail);
+		local_unlock_irqrestore(&cpu_fbatches.lock_irq, flags);
 	}
 
-	pvec = &per_cpu(lru_deactivate_pvecs, cpu);
-	if (pagevec_count(pvec))
-		pagevec_lru_move_fn(pvec, lru_deactivate_fn, NULL);
+	fbatch = &fbatches->lru_deactivate_file;
+	if (folio_batch_count(fbatch))
+		folio_batch_move_lru(fbatch, lru_deactivate_file);
 
-	activate_page_drain(cpu);
+	fbatch = &fbatches->lru_deactivate;
+	if (folio_batch_count(fbatch))
+		folio_batch_move_lru(fbatch, lru_deactivate);
+
+	fbatch = &fbatches->lru_lazyfree;
+	if (folio_batch_count(fbatch))
+		folio_batch_move_lru(fbatch, lru_lazyfree);
+
+	folio_activate_drain(cpu);
 }
 
 /**
- * deactivate_page - forcefully deactivate a page
- * @page: page to deactivate
+ * deactivate_file_folio() - Deactivate a file folio.
+ * @folio: Folio to deactivate.
  *
- * This function hints the VM that @page is a good reclaim candidate,
- * for example if its invalidation fails due to the page being dirty
+ * This function hints to the VM that @folio is a good reclaim candidate,
+ * for example if its invalidation fails due to the folio being dirty
  * or under writeback.
+ *
+ * Context: Caller holds a reference on the folio.
  */
-void deactivate_page(struct page *page)
+void deactivate_file_folio(struct folio *folio)
 {
-	/*
-	 * In a workload with many unevictable page such as mprotect, unevictable
-	 * page deactivation for accelerating reclaim is pointless.
-	 */
-	if (PageUnevictable(page))
+	/* Deactivating an unevictable folio will not accelerate reclaim */
+	if (folio_test_unevictable(folio) || !folio_test_lru(folio))
 		return;
 
-	if (likely(get_page_unless_zero(page))) {
-		struct pagevec *pvec = &get_cpu_var(lru_deactivate_pvecs);
+	if (lru_gen_enabled() && lru_gen_clear_refs(folio))
+		return;
 
-		if (!pagevec_add(pvec, page))
-			pagevec_lru_move_fn(pvec, lru_deactivate_fn, NULL);
-		put_cpu_var(lru_deactivate_pvecs);
-	}
+	folio_batch_add_and_move(folio, lru_deactivate_file);
+}
+
+/*
+ * folio_deactivate - deactivate a folio
+ * @folio: folio to deactivate
+ *
+ * folio_deactivate() moves @folio to the inactive list if @folio was on the
+ * active list and was not unevictable. This is done to accelerate the
+ * reclaim of @folio.
+ */
+void folio_deactivate(struct folio *folio)
+{
+	if (folio_test_unevictable(folio) || !folio_test_lru(folio))
+		return;
+
+	if (lru_gen_enabled() ? lru_gen_clear_refs(folio) : !folio_test_active(folio))
+		return;
+
+	folio_batch_add_and_move(folio, lru_deactivate);
+}
+
+/**
+ * folio_mark_lazyfree - make an anon folio lazyfree
+ * @folio: folio to deactivate
+ *
+ * folio_mark_lazyfree() moves @folio to the inactive file list.
+ * This is done to accelerate the reclaim of @folio.
+ */
+void folio_mark_lazyfree(struct folio *folio)
+{
+	if (!folio_test_anon(folio) || !folio_test_swapbacked(folio) ||
+	    !folio_test_lru(folio) ||
+	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
+		return;
+
+	folio_batch_add_and_move(folio, lru_lazyfree);
 }
 
 void lru_add_drain(void)
 {
-	lru_add_drain_cpu(get_cpu());
-	put_cpu();
+	local_lock(&cpu_fbatches.lock);
+	lru_add_drain_cpu(smp_processor_id());
+	local_unlock(&cpu_fbatches.lock);
+	mlock_drain_local();
 }
+
+/*
+ * It's called from per-cpu workqueue context in SMP case so
+ * lru_add_drain_cpu and invalidate_bh_lrus_cpu should run on
+ * the same cpu. It shouldn't be a problem in !SMP case since
+ * the core is only one and the locks will disable preemption.
+ */
+static void lru_add_and_bh_lrus_drain(void)
+{
+	local_lock(&cpu_fbatches.lock);
+	lru_add_drain_cpu(smp_processor_id());
+	local_unlock(&cpu_fbatches.lock);
+	invalidate_bh_lrus_cpu();
+	mlock_drain_local();
+}
+
+void lru_add_drain_cpu_zone(struct zone *zone)
+{
+	local_lock(&cpu_fbatches.lock);
+	lru_add_drain_cpu(smp_processor_id());
+	drain_local_pages(zone);
+	local_unlock(&cpu_fbatches.lock);
+	mlock_drain_local();
+}
+
+#ifdef CONFIG_SMP
+
+static DEFINE_PER_CPU(struct work_struct, lru_add_drain_work);
 
 static void lru_add_drain_per_cpu(struct work_struct *dummy)
 {
+	lru_add_and_bh_lrus_drain();
+}
+
+static bool cpu_needs_drain(unsigned int cpu)
+{
+	struct cpu_fbatches *fbatches = &per_cpu(cpu_fbatches, cpu);
+
+	/* Check these in order of likelihood that they're not zero */
+	return folio_batch_count(&fbatches->lru_add) ||
+		folio_batch_count(&fbatches->lru_move_tail) ||
+		folio_batch_count(&fbatches->lru_deactivate_file) ||
+		folio_batch_count(&fbatches->lru_deactivate) ||
+		folio_batch_count(&fbatches->lru_lazyfree) ||
+		folio_batch_count(&fbatches->lru_activate) ||
+		need_mlock_drain(cpu) ||
+		has_bh_in_lru(cpu, NULL);
+}
+
+/*
+ * Doesn't need any cpu hotplug locking because we do rely on per-cpu
+ * kworkers being shut down before our page_alloc_cpu_dead callback is
+ * executed on the offlined cpu.
+ * Calling this function with cpu hotplug locks held can actually lead
+ * to obscure indirect dependencies via WQ context.
+ */
+static inline void __lru_add_drain_all(bool force_all_cpus)
+{
+	/*
+	 * lru_drain_gen - Global pages generation number
+	 *
+	 * (A) Definition: global lru_drain_gen = x implies that all generations
+	 *     0 < n <= x are already *scheduled* for draining.
+	 *
+	 * This is an optimization for the highly-contended use case where a
+	 * user space workload keeps constantly generating a flow of pages for
+	 * each CPU.
+	 */
+	static unsigned int lru_drain_gen;
+	static struct cpumask has_work;
+	static DEFINE_MUTEX(lock);
+	unsigned cpu, this_gen;
+
+	/*
+	 * Make sure nobody triggers this path before mm_percpu_wq is fully
+	 * initialized.
+	 */
+	if (WARN_ON(!mm_percpu_wq))
+		return;
+
+	/*
+	 * Guarantee folio_batch counter stores visible by this CPU
+	 * are visible to other CPUs before loading the current drain
+	 * generation.
+	 */
+	smp_mb();
+
+	/*
+	 * (B) Locally cache global LRU draining generation number
+	 *
+	 * The read barrier ensures that the counter is loaded before the mutex
+	 * is taken. It pairs with smp_mb() inside the mutex critical section
+	 * at (D).
+	 */
+	this_gen = smp_load_acquire(&lru_drain_gen);
+
+	/* It helps everyone if we do our own local drain immediately. */
+	lru_add_drain();
+
+	mutex_lock(&lock);
+
+	/*
+	 * (C) Exit the draining operation if a newer generation, from another
+	 * lru_add_drain_all(), was already scheduled for draining. Check (A).
+	 */
+	if (unlikely(this_gen != lru_drain_gen && !force_all_cpus))
+		goto done;
+
+	/*
+	 * (D) Increment global generation number
+	 *
+	 * Pairs with smp_load_acquire() at (B), outside of the critical
+	 * section. Use a full memory barrier to guarantee that the
+	 * new global drain generation number is stored before loading
+	 * folio_batch counters.
+	 *
+	 * This pairing must be done here, before the for_each_online_cpu loop
+	 * below which drains the page vectors.
+	 *
+	 * Let x, y, and z represent some system CPU numbers, where x < y < z.
+	 * Assume CPU #z is in the middle of the for_each_online_cpu loop
+	 * below and has already reached CPU #y's per-cpu data. CPU #x comes
+	 * along, adds some pages to its per-cpu vectors, then calls
+	 * lru_add_drain_all().
+	 *
+	 * If the paired barrier is done at any later step, e.g. after the
+	 * loop, CPU #x will just exit at (C) and miss flushing out all of its
+	 * added pages.
+	 */
+	WRITE_ONCE(lru_drain_gen, lru_drain_gen + 1);
+	smp_mb();
+
+	cpumask_clear(&has_work);
+	for_each_online_cpu(cpu) {
+		struct work_struct *work = &per_cpu(lru_add_drain_work, cpu);
+
+		if (cpu_needs_drain(cpu)) {
+			INIT_WORK(work, lru_add_drain_per_cpu);
+			queue_work_on(cpu, mm_percpu_wq, work);
+			__cpumask_set_cpu(cpu, &has_work);
+		}
+	}
+
+	for_each_cpu(cpu, &has_work)
+		flush_work(&per_cpu(lru_add_drain_work, cpu));
+
+done:
+	mutex_unlock(&lock);
+}
+
+void lru_add_drain_all(void)
+{
+	__lru_add_drain_all(false);
+}
+#else
+void lru_add_drain_all(void)
+{
 	lru_add_drain();
 }
+#endif /* CONFIG_SMP */
+
+atomic_t lru_disable_count = ATOMIC_INIT(0);
 
 /*
- * Returns 0 for success
+ * lru_cache_disable() needs to be called before we start compiling
+ * a list of folios to be migrated using folio_isolate_lru().
+ * It drains folios on LRU cache and then disable on all cpus until
+ * lru_cache_enable is called.
+ *
+ * Must be paired with a call to lru_cache_enable().
  */
-int lru_add_drain_all(void)
+void lru_cache_disable(void)
 {
-	return schedule_on_each_cpu(lru_add_drain_per_cpu);
+	atomic_inc(&lru_disable_count);
+	/*
+	 * Readers of lru_disable_count are protected by either disabling
+	 * preemption or rcu_read_lock:
+	 *
+	 * preempt_disable, local_irq_disable  [bh_lru_lock()]
+	 * rcu_read_lock		       [rt_spin_lock CONFIG_PREEMPT_RT]
+	 * preempt_disable		       [local_lock !CONFIG_PREEMPT_RT]
+	 *
+	 * Since v5.1 kernel, synchronize_rcu() is guaranteed to wait on
+	 * preempt_disable() regions of code. So any CPU which sees
+	 * lru_disable_count = 0 will have exited the critical
+	 * section when synchronize_rcu() returns.
+	 */
+	synchronize_rcu_expedited();
+#ifdef CONFIG_SMP
+	__lru_add_drain_all(true);
+#else
+	lru_add_and_bh_lrus_drain();
+#endif
 }
 
-/*
- * Batched page_cache_release().  Decrement the reference count on all the
- * passed pages.  If it fell to zero then remove the page from the LRU and
- * free it.
+/**
+ * folios_put_refs - Reduce the reference count on a batch of folios.
+ * @folios: The folios.
+ * @refs: The number of refs to subtract from each folio.
  *
- * Avoid taking zone->lru_lock if possible, but if it is taken, retain it
- * for the remainder of the operation.
+ * Like folio_put(), but for a batch of folios.  This is more efficient
+ * than writing the loop yourself as it will optimise the locks which need
+ * to be taken if the folios are freed.  The folios batch is returned
+ * empty and ready to be reused for another batch; there is no need
+ * to reinitialise it.  If @refs is NULL, we subtract one from each
+ * folio refcount.
  *
- * The locking in this function is against shrink_inactive_list(): we recheck
- * the page count inside the lock to see whether shrink_inactive_list()
- * grabbed the page via the LRU.  If it did, give up: shrink_inactive_list()
- * will free it.
+ * Context: May be called in process or interrupt context, but not in NMI
+ * context.  May be called while holding a spinlock.
  */
-void release_pages(struct page **pages, int nr, int cold)
+void folios_put_refs(struct folio_batch *folios, unsigned int *refs)
 {
-	int i;
-	LIST_HEAD(pages_to_free);
-	struct zone *zone = NULL;
-	struct lruvec *lruvec;
-	unsigned long uninitialized_var(flags);
+	int i, j;
+	struct lruvec *lruvec = NULL;
+	unsigned long flags = 0;
 
-	for (i = 0; i < nr; i++) {
-		struct page *page = pages[i];
+	for (i = 0, j = 0; i < folios->nr; i++) {
+		struct folio *folio = folios->folios[i];
+		unsigned int nr_refs = refs ? refs[i] : 1;
 
-		if (unlikely(PageCompound(page))) {
-			if (zone) {
-				spin_unlock_irqrestore(&zone->lru_lock, flags);
-				zone = NULL;
+		if (is_huge_zero_folio(folio))
+			continue;
+
+		if (folio_is_zone_device(folio)) {
+			if (lruvec) {
+				unlock_page_lruvec_irqrestore(lruvec, flags);
+				lruvec = NULL;
 			}
-			put_compound_page(page);
+			if (folio_ref_sub_and_test(folio, nr_refs))
+				free_zone_device_folio(folio);
 			continue;
 		}
 
-		if (!put_page_testzero(page))
+		if (!folio_ref_sub_and_test(folio, nr_refs))
 			continue;
 
-		if (PageLRU(page)) {
-			struct zone *pagezone = page_zone(page);
-
-			if (pagezone != zone) {
-				if (zone)
-					spin_unlock_irqrestore(&zone->lru_lock,
-									flags);
-				zone = pagezone;
-				spin_lock_irqsave(&zone->lru_lock, flags);
+		/* hugetlb has its own memcg */
+		if (folio_test_hugetlb(folio)) {
+			if (lruvec) {
+				unlock_page_lruvec_irqrestore(lruvec, flags);
+				lruvec = NULL;
 			}
-
-			lruvec = mem_cgroup_page_lruvec(page, zone);
-			VM_BUG_ON(!PageLRU(page));
-			__ClearPageLRU(page);
-			del_page_from_lru_list(page, lruvec, page_off_lru(page));
+			free_huge_folio(folio);
+			continue;
 		}
+		folio_unqueue_deferred_split(folio);
+		__page_cache_release(folio, &lruvec, &flags);
 
-		list_add(&page->lru, &pages_to_free);
+		if (j != i)
+			folios->folios[j] = folio;
+		j++;
 	}
-	if (zone)
-		spin_unlock_irqrestore(&zone->lru_lock, flags);
+	if (lruvec)
+		unlock_page_lruvec_irqrestore(lruvec, flags);
+	if (!j) {
+		folio_batch_reinit(folios);
+		return;
+	}
 
-	free_hot_cold_page_list(&pages_to_free, cold);
+	folios->nr = j;
+	mem_cgroup_uncharge_folios(folios);
+	free_unref_folios(folios);
+}
+EXPORT_SYMBOL(folios_put_refs);
+
+/**
+ * release_pages - batched put_page()
+ * @arg: array of pages to release
+ * @nr: number of pages
+ *
+ * Decrement the reference count on all the pages in @arg.  If it
+ * fell to zero, remove the page from the LRU and free it.
+ *
+ * Note that the argument can be an array of pages, encoded pages,
+ * or folio pointers. We ignore any encoded bits, and turn any of
+ * them into just a folio that gets free'd.
+ */
+void release_pages(release_pages_arg arg, int nr)
+{
+	struct folio_batch fbatch;
+	int refs[PAGEVEC_SIZE];
+	struct encoded_page **encoded = arg.encoded_pages;
+	int i;
+
+	folio_batch_init(&fbatch);
+	for (i = 0; i < nr; i++) {
+		/* Turn any of the argument types into a folio */
+		struct folio *folio = page_folio(encoded_page_ptr(encoded[i]));
+
+		/* Is our next entry actually "nr_pages" -> "nr_refs" ? */
+		refs[fbatch.nr] = 1;
+		if (unlikely(encoded_page_flags(encoded[i]) &
+			     ENCODED_PAGE_BIT_NR_PAGES_NEXT))
+			refs[fbatch.nr] = encoded_nr_pages(encoded[++i]);
+
+		if (folio_batch_add(&fbatch, folio) > 0)
+			continue;
+		folios_put_refs(&fbatch, refs);
+	}
+
+	if (fbatch.nr)
+		folios_put_refs(&fbatch, refs);
 }
 EXPORT_SYMBOL(release_pages);
 
 /*
- * The pages which we're about to release may be in the deferred lru-addition
+ * The folios which we're about to release may be in the deferred lru-addition
  * queues.  That would prevent them from really being freed right now.  That's
- * OK from a correctness point of view but is inefficient - those pages may be
+ * OK from a correctness point of view but is inefficient - those folios may be
  * cache-warm and we want to give them back to the page allocator ASAP.
  *
- * So __pagevec_release() will drain those queues here.  __pagevec_lru_add()
- * and __pagevec_lru_add_active() call release_pages() directly to avoid
+ * So __folio_batch_release() will drain those queues here.
+ * folio_batch_move_lru() calls folios_put() directly to avoid
  * mutual recursion.
  */
-void __pagevec_release(struct pagevec *pvec)
+void __folio_batch_release(struct folio_batch *fbatch)
 {
-	lru_add_drain();
-	release_pages(pvec->pages, pagevec_count(pvec), pvec->cold);
-	pagevec_reinit(pvec);
-}
-EXPORT_SYMBOL(__pagevec_release);
-
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-/* used by __split_huge_page_refcount() */
-void lru_add_page_tail(struct page *page, struct page *page_tail,
-		       struct lruvec *lruvec, struct list_head *list)
-{
-	int uninitialized_var(active);
-	enum lru_list lru;
-	const int file = 0;
-
-	VM_BUG_ON(!PageHead(page));
-	VM_BUG_ON(PageCompound(page_tail));
-	VM_BUG_ON(PageLRU(page_tail));
-	VM_BUG_ON(NR_CPUS != 1 &&
-		  !spin_is_locked(&lruvec_zone(lruvec)->lru_lock));
-
-	if (!list)
-		SetPageLRU(page_tail);
-
-	if (page_evictable(page_tail)) {
-		if (PageActive(page)) {
-			SetPageActive(page_tail);
-			active = 1;
-			lru = LRU_ACTIVE_ANON;
-		} else {
-			active = 0;
-			lru = LRU_INACTIVE_ANON;
-		}
-	} else {
-		SetPageUnevictable(page_tail);
-		lru = LRU_UNEVICTABLE;
+	if (!fbatch->percpu_pvec_drained) {
+		lru_add_drain();
+		fbatch->percpu_pvec_drained = true;
 	}
-
-	if (likely(PageLRU(page)))
-		list_add_tail(&page_tail->lru, &page->lru);
-	else if (list) {
-		/* page reclaim is reclaiming a huge page */
-		get_page(page_tail);
-		list_add_tail(&page_tail->lru, list);
-	} else {
-		struct list_head *list_head;
-		/*
-		 * Head page has not yet been counted, as an hpage,
-		 * so we must account for each subpage individually.
-		 *
-		 * Use the standard add function to put page_tail on the list,
-		 * but then correct its position so they all end up in order.
-		 */
-		add_page_to_lru_list(page_tail, lruvec, lru);
-		list_head = page_tail->lru.prev;
-		list_move_tail(&page_tail->lru, list_head);
-	}
-
-	if (!PageUnevictable(page))
-		update_page_reclaim_stat(lruvec, file, active);
+	folios_put(fbatch);
 }
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
-
-static void __pagevec_lru_add_fn(struct page *page, struct lruvec *lruvec,
-				 void *arg)
-{
-	enum lru_list lru = (enum lru_list)arg;
-	int file = is_file_lru(lru);
-	int active = is_active_lru(lru);
-
-	VM_BUG_ON(PageActive(page));
-	VM_BUG_ON(PageUnevictable(page));
-	VM_BUG_ON(PageLRU(page));
-
-	SetPageLRU(page);
-	if (active)
-		SetPageActive(page);
-	add_page_to_lru_list(page, lruvec, lru);
-	update_page_reclaim_stat(lruvec, file, active);
-}
-
-/*
- * Add the passed pages to the LRU, then drop the caller's refcount
- * on them.  Reinitialises the caller's pagevec.
- */
-void __pagevec_lru_add(struct pagevec *pvec, enum lru_list lru)
-{
-	VM_BUG_ON(is_unevictable_lru(lru));
-
-	pagevec_lru_move_fn(pvec, __pagevec_lru_add_fn, (void *)lru);
-}
-EXPORT_SYMBOL(__pagevec_lru_add);
+EXPORT_SYMBOL(__folio_batch_release);
 
 /**
- * pagevec_lookup - gang pagecache lookup
- * @pvec:	Where the resulting pages are placed
- * @mapping:	The address_space to search
- * @start:	The starting page index
- * @nr_pages:	The maximum number of pages
+ * folio_batch_remove_exceptionals() - Prune non-folios from a batch.
+ * @fbatch: The batch to prune
  *
- * pagevec_lookup() will search for and return a group of up to @nr_pages pages
- * in the mapping.  The pages are placed in @pvec.  pagevec_lookup() takes a
- * reference against the pages in @pvec.
- *
- * The search returns a group of mapping-contiguous pages with ascending
- * indexes.  There may be holes in the indices due to not-present pages.
- *
- * pagevec_lookup() returns the number of pages which were found.
+ * find_get_entries() fills a batch with both folios and shadow/swap/DAX
+ * entries.  This function prunes all the non-folio entries from @fbatch
+ * without leaving holes, so that it can be passed on to folio-only batch
+ * operations.
  */
-unsigned pagevec_lookup(struct pagevec *pvec, struct address_space *mapping,
-		pgoff_t start, unsigned nr_pages)
+void folio_batch_remove_exceptionals(struct folio_batch *fbatch)
 {
-	pvec->nr = find_get_pages(mapping, start, nr_pages, pvec->pages);
-	return pagevec_count(pvec);
-}
-EXPORT_SYMBOL(pagevec_lookup);
+	unsigned int i, j;
 
-unsigned pagevec_lookup_tag(struct pagevec *pvec, struct address_space *mapping,
-		pgoff_t *index, int tag, unsigned nr_pages)
-{
-	pvec->nr = find_get_pages_tag(mapping, index, tag,
-					nr_pages, pvec->pages);
-	return pagevec_count(pvec);
+	for (i = 0, j = 0; i < folio_batch_count(fbatch); i++) {
+		struct folio *folio = fbatch->folios[i];
+		if (!xa_is_value(folio))
+			fbatch->folios[j++] = folio;
+	}
+	fbatch->nr = j;
 }
-EXPORT_SYMBOL(pagevec_lookup_tag);
+
+static const struct ctl_table swap_sysctl_table[] = {
+	{
+		.procname	= "page-cluster",
+		.data		= &page_cluster,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= (void *)&page_cluster_max,
+	}
+};
 
 /*
  * Perform any setup for the swap system
  */
 void __init swap_setup(void)
 {
-	unsigned long megs = totalram_pages >> (20 - PAGE_SHIFT);
-#ifdef CONFIG_SWAP
-	int i;
-
-	bdi_init(swapper_spaces[0].backing_dev_info);
-	for (i = 0; i < MAX_SWAPFILES; i++) {
-		spin_lock_init(&swapper_spaces[i].tree_lock);
-		INIT_LIST_HEAD(&swapper_spaces[i].i_mmap_nonlinear);
-	}
-#endif
+	unsigned long megs = PAGES_TO_MB(totalram_pages());
 
 	/* Use a smaller cluster for small-memory machines */
 	if (megs < 16)
@@ -880,4 +1112,6 @@ void __init swap_setup(void)
 	 * Right now other parts of the system means that we
 	 * _really_ don't want to cluster much more
 	 */
+
+	register_sysctl_init("vm", swap_sysctl_table);
 }

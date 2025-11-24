@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
@@ -5,9 +6,10 @@
  *
  * Copyright (C) 1995, 96, 97, 98, 99, 2003, 05 Ralf Baechle
  */
-#ifndef _ASM_FCNTL_H
-#define _ASM_FCNTL_H
+#ifndef _UAPI_ASM_FCNTL_H
+#define _UAPI_ASM_FCNTL_H
 
+#include <asm/sgidefs.h>
 
 #define O_APPEND	0x0008
 #define O_DSYNC		0x0010	/* used to be O_SYNC, see below */
@@ -42,36 +44,17 @@
 #define F_SETOWN	24	/*  for sockets. */
 #define F_GETOWN	23	/*  for sockets. */
 
-#ifndef __mips64
+#if __BITS_PER_LONG == 32 || defined(__KERNEL__)
 #define F_GETLK64	33	/*  using 'struct flock64' */
 #define F_SETLK64	34
 #define F_SETLKW64	35
+#endif /* __BITS_PER_LONG == 32 || defined(__KERNEL__) */
+
+#if _MIPS_SIM != _MIPS_SIM_ABI64
+#define __ARCH_FLOCK_EXTRA_SYSID	long l_sysid;
+#define __ARCH_FLOCK_PAD		long pad[4];
 #endif
-
-/*
- * The flavours of struct flock.  "struct flock" is the ABI compliant
- * variant.  Finally struct flock64 is the LFS variant of struct flock.	 As
- * a historic accident and inconsistence with the ABI definition it doesn't
- * contain all the same fields as struct flock.
- */
-
-#ifdef CONFIG_32BIT
-#include <linux/types.h>
-
-struct flock {
-	short	l_type;
-	short	l_whence;
-	off_t	l_start;
-	off_t	l_len;
-	long	l_sysid;
-	__kernel_pid_t l_pid;
-	long	pad[4];
-};
-
-#define HAVE_ARCH_STRUCT_FLOCK
-
-#endif /* CONFIG_32BIT */
 
 #include <asm-generic/fcntl.h>
 
-#endif /* _ASM_FCNTL_H */
+#endif /* _UAPI_ASM_FCNTL_H */

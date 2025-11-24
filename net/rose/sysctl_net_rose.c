@@ -1,8 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  *
  * Copyright (C) 1996 Mike Shaver (shaver@zeroknowledge.com)
  */
@@ -24,7 +21,7 @@ static int min_window[] = {1}, max_window[] = {7};
 
 static struct ctl_table_header *rose_table_header;
 
-static ctl_table rose_table[] = {
+static struct ctl_table rose_table[] = {
 	{
 		.procname	= "restart_request_timeout",
 		.data		= &sysctl_rose_restart_request_timeout,
@@ -115,7 +112,6 @@ static ctl_table rose_table[] = {
 		.extra1		= &min_window,
 		.extra2		= &max_window
 	},
-	{ }
 };
 
 void __init rose_register_sysctl(void)

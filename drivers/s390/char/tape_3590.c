@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  *    tape device discipline for 3590 tapes.
  *
@@ -10,6 +11,7 @@
 #define KMSG_COMPONENT "tape_3590"
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
+#include <linux/export.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/init.h>
@@ -112,16 +114,16 @@ static int crypt_enabled(struct tape_device *device)
 static void ext_to_int_kekl(struct tape390_kekl *in,
 			    struct tape3592_kekl *out)
 {
-	int i;
+	int len;
 
 	memset(out, 0, sizeof(*out));
 	if (in->type == TAPE390_KEKL_TYPE_HASH)
 		out->flags |= 0x40;
 	if (in->type_on_tape == TAPE390_KEKL_TYPE_HASH)
 		out->flags |= 0x80;
-	strncpy(out->label, in->label, 64);
-	for (i = strlen(in->label); i < sizeof(out->label); i++)
-		out->label[i] = ' ';
+	len = min(sizeof(out->label), strlen(in->label));
+	memcpy(out->label, in->label, len);
+	memset(out->label + len, ' ', sizeof(out->label) - len);
 	ASCEBC(out->label, sizeof(out->label));
 }
 
@@ -312,15 +314,10 @@ static int tape_3592_ioctl_kekl_set(struct tape_device *device,
 		return -ENOSYS;
 	if (!crypt_enabled(device))
 		return -EUNATCH;
-	ext_kekls = kmalloc(sizeof(*ext_kekls), GFP_KERNEL);
-	if (!ext_kekls)
-		return -ENOMEM;
-	if (copy_from_user(ext_kekls, (char __user *)arg, sizeof(*ext_kekls))) {
-		rc = -EFAULT;
-		goto out;
-	}
+	ext_kekls = memdup_user((char __user *)arg, sizeof(*ext_kekls));
+	if (IS_ERR(ext_kekls))
+		return PTR_ERR(ext_kekls);
 	rc = tape_3592_kekl_set(device, ext_kekls);
-out:
 	kfree(ext_kekls);
 	return rc;
 }
@@ -765,7 +762,7 @@ tape_3590_done(struct tape_device *device, struct tape_request *request)
  * This function is called, when error recovery was successful
  */
 static inline int
-tape_3590_erp_succeded(struct tape_device *device, struct tape_request *request)
+tape_3590_erp_succeeded(struct tape_device *device, struct tape_request *request)
 {
 	DBF_EVENT(3, "Error Recovery successful for %s\n",
 		  tape_op_verbose[request->op]);
@@ -835,7 +832,7 @@ tape_3590_erp_basic(struct tape_device *device, struct tape_request *request,
 	case SENSE_BRA_PER:
 		return tape_3590_erp_failed(device, request, irb, rc);
 	case SENSE_BRA_CONT:
-		return tape_3590_erp_succeded(device, request);
+		return tape_3590_erp_succeeded(device, request);
 	case SENSE_BRA_RE:
 		return tape_3590_erp_retry(device, request, irb);
 	case SENSE_BRA_DRE:
@@ -975,7 +972,7 @@ tape_3590_print_mim_msg_f0(struct tape_device *device, struct irb *irb)
 		snprintf(exception, BUFSIZE, "Data degraded");
 		break;
 	case 0x03:
-		snprintf(exception, BUFSIZE, "Data degraded in partion %i",
+		snprintf(exception, BUFSIZE, "Data degraded in partition %i",
 			sense->fmt.f70.mp);
 		break;
 	case 0x04:
@@ -1090,7 +1087,7 @@ tape_3590_print_io_sim_msg_f1(struct tape_device *device, struct irb *irb)
 				"channel path 0x%x on CU",
 				sense->fmt.f71.md[1]);
 		else
-			snprintf(service, BUFSIZE, "Repair will disable cannel"
+			snprintf(service, BUFSIZE, "Repair will disable channel"
 				" paths (0x%x-0x%x) on CU",
 				sense->fmt.f71.md[1], sense->fmt.f71.md[2]);
 		break;
@@ -1481,7 +1478,7 @@ tape_3590_irq(struct tape_device *device, struct tape_request *request,
 	}
 
 	if (irb->scsw.cmd.dstat & DEV_STAT_CHN_END) {
-		DBF_EVENT(2, "cannel end\n");
+		DBF_EVENT(2, "channel end\n");
 		return TAPE_IO_PENDING;
 	}
 
@@ -1655,7 +1652,6 @@ static struct ccw_driver tape_3590_driver = {
 	.remove = tape_generic_remove,
 	.set_offline = tape_generic_offline,
 	.set_online = tape_3590_online,
-	.freeze = tape_generic_pm_suspend,
 	.int_class = IRQIO_TAP,
 };
 
@@ -1675,7 +1671,7 @@ tape_3590_init(void)
 
 	DBF_EVENT(3, "3590 init\n");
 
-	tape_3590_wq = alloc_workqueue("tape_3590", 0, 0);
+	tape_3590_wq = alloc_workqueue("tape_3590", WQ_PERCPU, 0);
 	if (!tape_3590_wq)
 		return -ENOMEM;
 

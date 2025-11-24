@@ -1,8 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (C) ST-Ericsson SA 2007-2010
  * Author: Per Friden <per.friden@stericsson.com> for ST-Ericsson SA
  * Author: Jonas Aaberg <jonas.aberg@stericsson.com> for ST-Ericsson SA
- * License terms: GNU General Public License (GPL) version 2
  */
 #ifndef STE_DMA40_LL_H
 #define STE_DMA40_LL_H
@@ -369,7 +369,7 @@ struct d40_phy_lli_bidir {
  * @lcsp02: Either maps to register lcsp0 if src or lcsp2 if dst.
  * @lcsp13: Either maps to register lcsp1 if src or lcsp3 if dst.
  *
- * This struct must be 8 bytes aligned since it will be accessed directy by
+ * This struct must be 8 bytes aligned since it will be accessed directly by
  * the DMA. Never add any none hw mapped registers to this struct.
  */
 
@@ -432,8 +432,7 @@ enum d40_lli_flags {
 
 void d40_phy_cfg(struct stedma40_chan_cfg *cfg,
 		 u32 *src_cfg,
-		 u32 *dst_cfg,
-		 bool is_log);
+		 u32 *dst_cfg);
 
 void d40_log_cfg(struct stedma40_chan_cfg *cfg,
 		 u32 *lcsp1,

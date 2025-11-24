@@ -1,10 +1,9 @@
-#include "../evlist.h"
-#include "../cache.h"
+// SPDX-License-Identifier: GPL-2.0
+#include "gtk.h"
 #include "../evsel.h"
 #include "../sort.h"
 #include "../hist.h"
 #include "../helpline.h"
-#include "gtk.h"
 
 #include <signal.h>
 
@@ -43,7 +42,7 @@ const char *perf_gtk__get_percent_color(double percent)
 	return NULL;
 }
 
-#ifdef HAVE_GTK_INFO_BAR
+#ifdef HAVE_GTK_INFO_BAR_SUPPORT
 GtkWidget *perf_gtk__setup_info_bar(void)
 {
 	GtkWidget *info_bar;
