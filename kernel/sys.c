@@ -44,6 +44,7 @@
 #include <linux/syscore_ops.h>
 #include <linux/version.h>
 #include <linux/ctype.h>
+#include <linux/limits.h>
 #include <linux/syscall_user_dispatch.h>
 
 #include <linux/compat.h>
@@ -1440,6 +1441,29 @@ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 		up_write(&uts_sem);
 	}
 	return errno;
+}
+
+/* Return the length of a user string, capped at maxlen. */
+SYSCALL_DEFINE2(demo_strlen, const char __user *, user_str, size_t, maxlen)
+{
+	size_t checked_len;
+	long len;
+
+	if (!maxlen)
+		return 0;
+
+	checked_len = maxlen + 1;
+	if (checked_len <= maxlen || checked_len > LONG_MAX)
+		return -EOVERFLOW;
+
+	len = strnlen_user(user_str, (long)checked_len);
+	if (!len)
+		return -EFAULT;
+
+	if (len > maxlen)
+		return maxlen;
+
+	return len - 1;
 }
 
 #ifdef __ARCH_WANT_SYS_GETHOSTNAME
