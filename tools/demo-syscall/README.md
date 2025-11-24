@@ -25,5 +25,5 @@ Debug info (for repeatable GDB setup)
 - To build with DWARF symbols in a fresh checkout: run `./scripts/config --enable CONFIG_DEBUG_INFO` (optionally also `CONFIG_DEBUG_INFO_DWARF4`/`CONFIG_DEBUG_INFO_DWARF5` and `CONFIG_GDB_SCRIPTS`), then rebuild with `make -j$(($(nproc)/2)) bzImage`.
 - If you want a reproducible debug-ready config without touching upstream defconfig, apply the provided fragment and regenerate `.config`:
   - `./scripts/kconfig/merge_config.sh arch/x86/configs/defconfig tools/demo-syscall/debug.config`
-  - `make olddefconfig`
+  - `make olddefconfig` (keeps your current settings, fills in new/unset symbols with defaults; `make defconfig` instead blows away your config and re-seeds from the stock defconfig)
   - `make -j$(($(nproc)/2)) bzImage`
